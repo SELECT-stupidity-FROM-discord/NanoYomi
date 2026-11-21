@@ -248,6 +248,12 @@ pub struct Prefs {
     pub sidebar_collapsed: bool,
     #[serde(default)]
     pub auto_download: bool,
+    /// Font family per slot (see `fonts::SLOTS`). A slot that's missing uses its bundled font.
+    #[serde(default)]
+    pub fonts: std::collections::HashMap<String, String>,
+    /// Open the reader in fullscreen.
+    #[serde(default)]
+    pub reader_fullscreen: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]

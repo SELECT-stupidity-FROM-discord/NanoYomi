@@ -48,7 +48,7 @@ fn ja(text: &'static str, on: bool, narrow: bool) -> AnyElement {
 }
 
 fn label(text: &'static str) -> impl IntoElement {
-    div().flex_none().px(u(10.)).pb(u(6.)).font_family(MONO).text_size(u(10.5)).text_color(rgb(FAINT)).child(text)
+    div().flex_none().px(u(10.)).pb(u(6.)).font_family(crate::fonts::mono()).text_size(u(10.5)).text_color(rgb(FAINT)).child(text)
 }
 
 impl Root {
@@ -127,7 +127,7 @@ impl Root {
             .child(search_icon())
             .when(!narrow, |d| {
                 d.child(div().flex_1().child("Search")).child(
-                    div().font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).px(u(5.)).border_1().border_color(rgb(LINE)).rounded(u(4.)).child(if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl K" }),
+                    div().font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).px(u(5.)).border_1().border_color(rgb(LINE)).rounded(u(4.)).child(if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl K" }),
                 )
             })
             .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx)));
@@ -144,7 +144,7 @@ impl Root {
                     .gap_2()
                     .when(!narrow, |d| d.px(u(8.)))
                     .child(div().font_family(CJK).font_weight(FontWeight::BLACK).text_size(u(22.)).text_color(rgb(ACCENT)).child("読"))
-                    .when(!narrow, |d| d.child(div().font_family(DISPLAY).font_weight(FontWeight::BLACK).text_size(u(24.)).child("NANO"))),
+                    .when(!narrow, |d| d.child(div().font_family(crate::fonts::display()).font_weight(FontWeight::BLACK).text_size(u(24.)).child("NANO"))),
             )
             .child(
                 div()
@@ -223,7 +223,7 @@ impl Root {
                     .when(narrow, |d| d.justify_center().px_0())
                     .border_t_1()
                     .border_color(rgb(RULE))
-                    .font_family(MONO)
+                    .font_family(crate::fonts::mono())
                     .text_size(u(11.))
                     .text_color(rgb(FAINT))
                     .child(div().flex_none().size(u(6.)).rounded(u(3.)).bg(rgb(color)))

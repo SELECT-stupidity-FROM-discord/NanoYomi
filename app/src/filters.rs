@@ -3,7 +3,7 @@
 
 use crate::browse::Browse;
 use crate::input::TextInput;
-use crate::{ACCENT_TEXT, BG, FAINT, HOVER, LINE, MONO, MUTED, TEXT, u};
+use crate::{ACCENT_TEXT, BG, FAINT, HOVER, LINE, MUTED, TEXT, u};
 use gpui::{
     AnyElement, AppContext, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, rgb,
@@ -108,7 +108,7 @@ fn control(p: Path, f: &Value, inputs: &HashMap<Path, Entity<TextInput>>, cx: &m
     };
     let options = |f: &Value| f["values"].as_array().cloned().unwrap_or_default();
     match f["type"].as_str().unwrap_or("") {
-        "header" => div().pt(u(6.)).font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).child(name.to_uppercase()).into_any_element(),
+        "header" => div().pt(u(6.)).font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child(name.to_uppercase()).into_any_element(),
         "separator" => div().h(u(1.)).bg(rgb(LINE)).into_any_element(),
         "text" => div()
             .flex()

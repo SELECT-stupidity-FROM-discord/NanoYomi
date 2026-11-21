@@ -1,7 +1,7 @@
 use crate::catalog::small_button;
 use crate::input::{InputEvent, TextInput};
 use crate::store::{Store, SyncStatus};
-use crate::{FAINT, MONO, MUTED, RULE, ACCENT_TEXT, heading, u};
+use crate::{FAINT, HOVER, LINE, MUTED, RULE, TEXT, ACCENT_TEXT, fonts, heading, u};
 use gpui::{
     AppContext, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, Render,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, rgb,
@@ -23,6 +23,13 @@ pub struct Settings {
     track_note: String,
     /// What the last export or import said.
     backup_note: String,
+    /// The font slot whose list is open.
+    font_open: Option<usize>,
+    /// Google families already in the fonts folder.
+    font_files: Vec<&'static str>,
+    downloading: Vec<&'static str>,
+    /// The family that failed to download, and why.
+    font_failed: Option<(&'static str, String)>,
 }
 
 impl Settings {
@@ -55,7 +62,7 @@ impl Settings {
         .detach();
         let new_category = plain("New category name", "", cx);
         cx.subscribe(&new_category, |this, _, _: &InputEvent, cx| this.add_category(cx)).detach();
-        Settings { store, covers_cleared: false, pages_cleared: false, sync_host, sync_key, solver, new_category, signing_in: None, track_note: String::new(), backup_note: String::new() }
+        Settings { store, covers_cleared: false, pages_cleared: false, sync_host, sync_key, solver, new_category, signing_in: None, track_note: String::new(), backup_note: String::new(), font_open: None, font_files: vec![], downloading: vec![], font_failed: None }
     }
 
     fn add_category(&mut self, cx: &mut Context<Self>) {
@@ -144,6 +151,46 @@ impl Settings {
             });
         })
         .detach();
+    }
+
+    /// Loads fonts the user may have put in the folder by hand, and notes which Google families are there.
+    fn scan_fonts(&mut self, cx: &mut Context<Self>) {
+        fonts::load(cx);
+        self.font_files = fonts::GOOGLE.into_iter().filter(|n| fonts::installed(n)).collect();
+    }
+
+    fn download_font(&mut self, name: &'static str, cx: &mut Context<Self>) {
+        if self.downloading.contains(&name) {
+            return;
+        }
+        self.downloading.push(name);
+        self.font_failed = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_executor().spawn(async move { fonts::download(name) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.downloading.retain(|n| *n != name);
+                match result {
+                    Ok(_) => this.scan_fonts(cx),
+                    Err(e) => this.font_failed = Some((name, e)),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn choose_font(&mut self, slot: usize, family: Option<&'static str>, cx: &mut Context<Self>) {
+        let key = fonts::SLOTS[slot].0.to_string();
+        self.font_open = None;
+        self.store.update(cx, |s, cx| {
+            s.edit_prefs(cx, |p| match family {
+                Some(f) => drop(p.fonts.insert(key, f.to_string())),
+                None => drop(p.fonts.remove(&key)),
+            })
+        });
+        fonts::choose(&self.store.read(cx).prefs().fonts);
+        cx.refresh_windows();
     }
 
     fn sync_now(&mut self, cx: &mut Context<Self>) {
@@ -313,6 +360,146 @@ impl Render for Settings {
                     )),
             )
             .child(div().flex_none().flex().gap(u(6.)).child(mode_chip("mode-ltr", "Left to right", (false, false), self.store.clone())).child(mode_chip("mode-rtl", "Right to left", (false, true), self.store.clone())).child(mode_chip("mode-vertical", "Vertical", (true, false), self.store.clone())));
+        let full = self.store.read(cx).prefs().reader_fullscreen;
+        let full_chip = |id: &'static str, label: &'static str, value: bool, store: Entity<Store>| {
+            small_button(id, label, full == value).on_click(move |_, _, cx| store.update(cx, |s, cx| s.edit_prefs(cx, |p| p.reader_fullscreen = value)))
+        };
+        let fullscreen = div()
+            .w_full()
+            .py(u(14.))
+            .border_b_1()
+            .border_color(rgb(RULE))
+            .flex()
+            .items_center()
+            .gap_4()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(u(4.))
+                    .child(div().text_size(u(15.)).font_weight(FontWeight::SEMIBOLD).child("Fullscreen reader"))
+                    .child(div().text_size(u(13.)).text_color(rgb(MUTED)).child("Go fullscreen when a chapter opens, and back when it closes. Press F in the reader to toggle it.")),
+            )
+            .child(div().flex_none().flex().gap(u(6.)).child(full_chip("full-off", "Off", false, self.store.clone())).child(full_chip("full-on", "On", true, self.store.clone())));
+
+        let font_rows = fonts::SLOTS.into_iter().enumerate().map(|(slot, (key, label, default))| {
+            let current = self.store.read(cx).prefs().fonts.get(key).cloned();
+            let open = self.font_open == Some(slot);
+            let list = open.then(|| {
+                let default_row = div()
+                    .id(("font-default", slot))
+                    .flex_none()
+                    .h(u(34.))
+                    .px(u(12.))
+                    .rounded(u(6.))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .when(current.is_none(), |d| d.bg(rgb(HOVER)).font_weight(FontWeight::SEMIBOLD))
+                    .when(current.is_some(), |d| d.text_color(rgb(MUTED)).hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT))))
+                    .child(format!("{default} (default)"))
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_font(slot, None, cx)));
+                let rows = fonts::GOOGLE.into_iter().enumerate().map(|(i, name)| {
+                    let have = self.font_files.contains(&name);
+                    let on = current.as_deref() == Some(name);
+                    let row = div()
+                        .id(("font", slot * 100 + i))
+                        .flex_none()
+                        .h(u(34.))
+                        .px(u(12.))
+                        .rounded(u(6.))
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(div().flex_1().min_w_0().truncate().child(name));
+                    if have {
+                        row.cursor_pointer()
+                            .when(on, |d| d.bg(rgb(HOVER)).font_weight(FontWeight::SEMIBOLD))
+                            .when(!on, |d| d.text_color(rgb(MUTED)).hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT))))
+                            .on_click(cx.listener(move |this, _, _, cx| this.choose_font(slot, Some(name), cx)))
+                    } else if self.downloading.contains(&name) {
+                        row.text_color(rgb(FAINT)).child(div().text_size(u(12.)).child("Downloading…"))
+                    } else {
+                        row.text_color(rgb(FAINT)).child(
+                            div()
+                                .id(("font-download", slot * 100 + i))
+                                .flex_none()
+                                .size(u(26.))
+                                .rounded(u(13.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                .child(gpui::svg().path("icons/download.svg").size(u(16.)).text_color(rgb(MUTED)))
+                                .on_click(cx.listener(move |this, _, _, cx| this.download_font(name, cx))),
+                        )
+                    }
+                });
+                div()
+                    .id(("font-list", slot))
+                    .w_full()
+                    .max_h(u(280.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .p(u(6.))
+                    .rounded(u(10.))
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .child(default_row)
+                    .children(rows)
+            });
+            let note = open.then(|| self.font_failed.clone()).flatten().map(|(name, why)| {
+                let page = format!("https://fonts.google.com/specimen/{}", name.replace(' ', "+"));
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(u(8.))
+                    .child(div().text_size(u(13.)).text_color(rgb(ACCENT_TEXT)).child(format!(
+                        "Couldn’t download {name} ({why}). Download it yourself from Google Fonts and put its .ttf files in {}, then open this list again.",
+                        fonts::folder()
+                    )))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(u(6.))
+                            .child(small_button(("font-page", slot), "Open Google Fonts", true).on_click(cx.listener(move |_, _, _, cx| cx.open_url(&page))))
+                            .child(small_button(("font-folder", slot), "Open fonts folder", false).on_click(cx.listener(|_, _, _, cx| {
+                                let _ = std::fs::create_dir_all(fonts::dir());
+                                cx.reveal_path(&fonts::dir());
+                            }))),
+                    )
+            });
+            div()
+                .w_full()
+                .py(u(14.))
+                .border_b_1()
+                .border_color(rgb(RULE))
+                .flex()
+                .flex_col()
+                .gap(u(10.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_4()
+                        .child(div().flex_1().min_w_0().text_size(u(15.)).font_weight(FontWeight::SEMIBOLD).child(label))
+                        .child(small_button(("font-slot", slot), "", open).child(current.clone().unwrap_or_else(|| default.to_string())).on_click(cx.listener(move |this, _, _, cx| {
+                            this.font_open = if this.font_open == Some(slot) { None } else { Some(slot) };
+                            if this.font_open.is_some() {
+                                this.scan_fonts(cx);
+                            }
+                            cx.notify();
+                        }))),
+                )
+                .children(note)
+                .children(list)
+        });
+        let fonts_note = div().pt(u(10.)).text_size(u(13.)).text_color(rgb(MUTED)).child("Pick a Google font and click its download icon first. It saves to the Nano fonts folder.");
+
         let chosen = self.store.read(cx).prefs().host_heap_mb;
         let auto = crate::host::auto_heap_mb();
         let effective = chosen.unwrap_or(auto);
@@ -386,7 +573,7 @@ impl Render for Settings {
                             .flex_none()
                             .max_w(u(320.))
                             .truncate()
-                            .font_family(MONO)
+                            .font_family(crate::fonts::mono())
                             .text_size(u(12.))
                             .text_color(rgb(if sync_failed { ACCENT_TEXT } else { FAINT }))
                             .child(sync_label),
@@ -455,7 +642,7 @@ impl Render for Settings {
                 .border_b_1()
                 .border_color(rgb(RULE))
                 .child(div().flex_1().min_w_0().text_size(u(15.)).font_weight(FontWeight::SEMIBOLD).child(crate::track::name(tracker)))
-                .child(div().font_family(MONO).text_size(u(12.)).text_color(rgb(FAINT)).child(note))
+                .child(div().font_family(crate::fonts::mono()).text_size(u(12.)).text_color(rgb(FAINT)).child(note))
                 .child(button)
         });
         let tracking = div()
@@ -478,19 +665,23 @@ impl Render for Settings {
             .pt(u(28.))
             .pb(u(40.))
             .child(heading("Settings", ""))
-            .child(div().pt(u(24.)).pb(u(10.)).font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).child("READING"))
+            .child(div().pt(u(24.)).pb(u(10.)).font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child("READING"))
             .child(reading)
-            .child(div().pt(u(24.)).pb(u(10.)).font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).child("CATEGORIES"))
+            .child(fullscreen)
+            .child(div().pt(u(24.)).pb(u(10.)).font_family(fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child("FONTS"))
+            .child(div().w_full().border_t_1().border_color(rgb(RULE)).children(font_rows))
+            .child(fonts_note)
+            .child(div().pt(u(24.)).pb(u(10.)).font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child("CATEGORIES"))
             .child(categories)
-            .child(div().pt(u(24.)).pb(u(10.)).font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).child("DOWNLOADS"))
+            .child(div().pt(u(24.)).pb(u(10.)).font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child("DOWNLOADS"))
             .child(downloads)
-            .child(div().pt(u(24.)).pb(u(10.)).font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).child("TRACKING"))
+            .child(div().pt(u(24.)).pb(u(10.)).font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child("TRACKING"))
             .child(tracking)
-            .child(div().pt(u(24.)).pb(u(10.)).font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).child("SYNC"))
+            .child(div().pt(u(24.)).pb(u(10.)).font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child("SYNC"))
             .child(sync)
-            .child(div().pt(u(24.)).pb(u(10.)).font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).child("BACKUP"))
+            .child(div().pt(u(24.)).pb(u(10.)).font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child("BACKUP"))
             .child(backup)
-            .child(div().pt(u(24.)).pb(u(10.)).font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).child("CLOUDFLARE"))
+            .child(div().pt(u(24.)).pb(u(10.)).font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child("CLOUDFLARE"))
             .child(
                 div()
                     .w_full()
@@ -515,10 +706,10 @@ impl Render for Settings {
                     )
                     .child(div().flex_none().w(u(340.)).child(self.solver.clone())),
             )
-            .child(div().pt(u(24.)).pb(u(10.)).font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).child("STORAGE"))
+            .child(div().pt(u(24.)).pb(u(10.)).font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child("STORAGE"))
             .child(storage)
             .child(pages)
-            .child(div().pt(u(24.)).pb(u(10.)).font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).child("MEMORY"))
+            .child(div().pt(u(24.)).pb(u(10.)).font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child("MEMORY"))
             .child(heap)
     }
 }

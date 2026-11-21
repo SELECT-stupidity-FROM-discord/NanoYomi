@@ -6,7 +6,7 @@ use crate::images::ImageCache;
 use crate::input::{InputEvent, TextInput};
 use crate::registry::Registry;
 use crate::store::{Progress, Series, Store};
-use crate::{FAINT, LINE, MONO, MUTED, RULE, Source, TEXT, heading, u};
+use crate::{FAINT, LINE, MUTED, RULE, Source, TEXT, heading, u};
 use gpui::{
     AppContext, Context, Entity, EventEmitter, FontWeight, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, rgb,
@@ -223,7 +223,7 @@ impl Render for Migrate {
                     .flex()
                     .flex_col()
                     .gap(u(10.))
-                    .child(div().font_family(MONO).text_size(u(12.)).text_color(rgb(MUTED)).child(name.to_uppercase()))
+                    .child(div().font_family(crate::fonts::mono()).text_size(u(12.)).text_color(rgb(MUTED)).child(name.to_uppercase()))
                     .child(body),
             );
         }

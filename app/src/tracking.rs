@@ -4,7 +4,7 @@ use crate::catalog::{chip, small_button};
 use crate::input::{InputEvent, TextInput};
 use crate::store::{Store, Track};
 use crate::track::{self, Found};
-use crate::{ACCENT_TEXT, FAINT, LINE, MONO, MUTED, RULE, SURFACE, TEXT, u};
+use crate::{ACCENT_TEXT, FAINT, LINE, MUTED, RULE, SURFACE, TEXT, u};
 use gpui::{
     AnyElement, AppContext, Context, Entity, EventEmitter, FontWeight, InteractiveElement, IntoElement, ParentElement,
     Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, rgb,
@@ -148,7 +148,7 @@ impl Tracking {
             }))
         };
         let (url, tracker) = (t.url.clone(), t.tracker);
-        let label = |s: &'static str| div().font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).child(s);
+        let label = |s: &'static str| div().font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child(s);
         div()
             .flex()
             .flex_col()
@@ -187,7 +187,7 @@ impl Tracking {
                     .items_center()
                     .gap_3()
                     .child(step("less", "−", -1, &t))
-                    .child(div().font_family(MONO).text_size(u(14.)).child(format!("{read} / {total}")))
+                    .child(div().font_family(crate::fonts::mono()).text_size(u(14.)).child(format!("{read} / {total}")))
                     .child(step("more", "+", 1, &t)),
             )
             .child(label("SCORE"))

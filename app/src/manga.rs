@@ -6,7 +6,7 @@ use crate::covers::{Covers, Fetch};
 use crate::images::ImageCache;
 use crate::input::{InputEvent, TextInput};
 use crate::store::{Store, default_hidden, now_ms, scanlator_counts, visible_chapters};
-use crate::{ACCENT_TEXT, BODY, DISPLAY, FAINT, LINE, MONO, MUTED, RULE, SURFACE, Source, TEXT, heading, pill};
+use crate::{ACCENT_TEXT, BODY, FAINT, LINE, MUTED, RULE, SURFACE, Source, TEXT, heading, pill};
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, EventEmitter, FontWeight, InteractiveElement, IntoElement, ListAlignment,
     ListState, ObjectFit, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, StyledImage,
@@ -729,7 +729,7 @@ impl MangaView {
                             .gap(u(8.))
                             .child(
                                 div()
-                                    .font_family(DISPLAY)
+                                    .font_family(crate::fonts::display())
                                     .font_weight(FontWeight::EXTRA_BOLD)
                                     .text_size(u(28.))
                                     .line_height(relative(1.))
@@ -792,7 +792,7 @@ impl MangaView {
 }
 
 fn mono(d: gpui::Div) -> gpui::Div {
-    d.font_family(MONO).text_size(u(12.))
+    d.font_family(crate::fonts::mono()).text_size(u(12.))
 }
 
 impl Render for MangaView {

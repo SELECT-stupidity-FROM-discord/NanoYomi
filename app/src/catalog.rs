@@ -8,7 +8,7 @@ use crate::input::{InputEvent, TextInput};
 use crate::registry::Registry;
 use crate::segmented::Segmented;
 use crate::store::Store;
-use crate::{ACCENT_TEXT, BG, FAINT, HOVER, LINE, MONO, MUTED, RULE, SURFACE, TEXT, heading};
+use crate::{ACCENT_TEXT, BG, FAINT, HOVER, LINE, MUTED, RULE, SURFACE, TEXT, heading};
 use gpui::{
     AnyElement, AppContext, Context, Entity, FontWeight, InteractiveElement, IntoElement, ListAlignment, ListState,
     ObjectFit, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription,
@@ -145,9 +145,9 @@ impl Catalog {
                         .flex_col()
                         .gap(u(2.))
                         .child(div().flex().items_baseline().gap_3().child(div().font_weight(FontWeight::SEMIBOLD).child(repo.name.clone())).child(
-                            div().min_w_0().truncate().font_family(MONO).text_size(u(12.)).text_color(rgb(FAINT)).child(repo.url.trim_end_matches("/index.json").to_string()),
+                            div().min_w_0().truncate().font_family(crate::fonts::mono()).text_size(u(12.)).text_color(rgb(FAINT)).child(repo.url.trim_end_matches("/index.json").to_string()),
                         ))
-                        .child(div().font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).child(format!("signed by {}…", &repo.key[..16])))
+                        .child(div().font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child(format!("signed by {}…", &repo.key[..16])))
                         .children(error.map(|e| div().text_size(u(13.)).text_color(rgb(ACCENT_TEXT)).child(e))),
                 )
                 .child(small_button(SharedString::from(format!("rm-repo-{url}")), "Remove", false).on_click(cx.listener(move |this, _, _, cx| {
@@ -279,7 +279,7 @@ impl Catalog {
                                     .child(div().font_weight(FontWeight::SEMIBOLD).child(e.name.clone()))
                                     .child(
                                         div()
-                                            .font_family(MONO)
+                                            .font_family(crate::fonts::mono())
                                             .text_size(u(12.))
                                             .text_color(rgb(FAINT))
                                             .child(if multi { format!("v{have}") } else { format!("{} · v{have}", e.langs.join(" ")) }),
@@ -336,14 +336,14 @@ impl Catalog {
                                         .rounded(u(4.))
                                         .border_1()
                                         .border_color(rgb(LINE))
-                                        .font_family(MONO)
+                                        .font_family(crate::fonts::mono())
                                         .text_size(u(10.))
                                         .text_color(rgb(MUTED))
                                         .child("18+"),
                                 )
                             }),
                     )
-                    .child(div().truncate().font_family(MONO).text_size(u(12.)).text_color(rgb(FAINT)).child(format!("{} · v{}", e.langs.join(" "), e.version))),
+                    .child(div().truncate().font_family(crate::fonts::mono()).text_size(u(12.)).text_color(rgb(FAINT)).child(format!("{} · v{}", e.langs.join(" "), e.version))),
             )
             .child(button)
             .into_any_element()
@@ -353,7 +353,7 @@ impl Catalog {
         match self.items.get(ix).copied() {
             Some(Item::Label(text)) => {
                 let text = if text == "AVAILABLE" { format!("AVAILABLE · {}", self.available.len()) } else { text.to_string() };
-                div().px(u(PAD)).pt(u(24.)).pb(u(10.)).font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).child(text).into_any_element()
+                div().px(u(PAD)).pt(u(24.)).pb(u(10.)).font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child(text).into_any_element()
             }
             Some(Item::Installed(i)) => self.installed_row(i, cx),
             Some(Item::Row(r)) => {
@@ -384,7 +384,7 @@ pub fn chip(id: impl Into<gpui::ElementId>, label: impl Into<SharedString>, on: 
         .flex()
         .items_center()
         .border_1()
-        .font_family(MONO)
+        .font_family(crate::fonts::mono())
         .text_size(u(12.))
         .cursor_pointer()
         .when(on, |d| d.bg(rgb(TEXT)).border_color(rgb(TEXT)).text_color(rgb(BG)))

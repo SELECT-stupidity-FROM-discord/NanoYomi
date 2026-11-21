@@ -2,7 +2,7 @@
 
 use crate::u;
 use crate::images::{self, ImageCache, Picture};
-use crate::{BG, DISPLAY, MONO, SURFACE, Source, TEXT, drop_images};
+use crate::{BG, SURFACE, Source, TEXT, drop_images};
 use gpui::{
     AnyElement, Context, Entity, FontWeight, IntoElement, ObjectFit, ParentElement, RenderImage, SharedString, Styled,
     StyledImage, div, img, prelude::FluentBuilder, relative, rgb,
@@ -184,7 +184,7 @@ pub fn cover(image: Option<Arc<RenderImage>>, title: &str, w: f32, h: f32, badge
             Some(image) => d.child(img(image).size_full().object_fit(ObjectFit::Cover)),
             None => d.flex().items_end().p_3().child(
                 div()
-                    .font_family(DISPLAY)
+                    .font_family(crate::fonts::display())
                     .font_weight(FontWeight::EXTRA_BOLD)
                     .text_size(u((w / 8.).clamp(14., 26.)))
                     .line_height(relative(1.))
@@ -207,7 +207,7 @@ pub fn cover(image: Option<Arc<RenderImage>>, title: &str, w: f32, h: f32, badge
                     .flex()
                     .items_center()
                     .justify_center()
-                    .font_family(MONO)
+                    .font_family(crate::fonts::mono())
                     .text_size(u(12.))
                     .text_color(rgb(TEXT))
                     .child(badge.to_string()),

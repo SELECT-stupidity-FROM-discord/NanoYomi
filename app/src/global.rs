@@ -6,7 +6,7 @@ use crate::images::ImageCache;
 use crate::input::{InputEvent, TextInput};
 use crate::registry::Registry;
 use crate::store::Store;
-use crate::{FAINT, MONO, MUTED, Source, heading, u};
+use crate::{FAINT, MUTED, Source, heading, u};
 use gpui::{
     AnyElement, AppContext, Context, Entity, EventEmitter, FontWeight, InteractiveElement, IntoElement, ParentElement,
     Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, rgb,
@@ -121,7 +121,7 @@ impl GlobalSearch {
             .flex()
             .flex_col()
             .gap(u(10.))
-            .child(div().font_family(MONO).text_size(u(12.)).text_color(rgb(MUTED)).child(label.to_uppercase()))
+            .child(div().font_family(crate::fonts::mono()).text_size(u(12.)).text_color(rgb(MUTED)).child(label.to_uppercase()))
             .child(body)
             .into_any_element()
     }

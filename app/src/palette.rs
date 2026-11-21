@@ -135,7 +135,7 @@ impl Root {
         for (i, e) in entries.into_iter().enumerate() {
             if e.group != last {
                 last = e.group;
-                rows.push(div().px(u(10.)).pt(u(10.)).pb(u(4.)).font_family(MONO).text_size(u(10.5)).text_color(rgb(FAINT)).child(e.group).into_any_element());
+                rows.push(div().px(u(10.)).pt(u(10.)).pb(u(4.)).font_family(crate::fonts::mono()).text_size(u(10.5)).text_color(rgb(FAINT)).child(e.group).into_any_element());
             }
             let on = i == selected;
             rows.push(
@@ -152,7 +152,7 @@ impl Root {
                     .hover(|d| d.bg(rgb(HOVER)))
                     .cursor_pointer()
                     .child(div().flex_1().min_w_0().truncate().child(e.label))
-                    .child(div().flex_none().font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).child(e.hint))
+                    .child(div().flex_none().font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child(e.hint))
                     .on_click(cx.listener(move |this, _, window, cx| this.pick(Some(i), window, cx)))
                     .into_any_element(),
             );

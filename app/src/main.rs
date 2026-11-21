@@ -6,6 +6,7 @@ mod downloads;
 mod ext_settings;
 mod extensions;
 mod filters;
+mod fonts;
 mod global;
 mod history;
 mod host;
@@ -101,13 +102,14 @@ pub const SLIDE: std::time::Duration = std::time::Duration::from_millis(240);
 
 struct Assets;
 
-const ICONS: [(&str, &[u8]); 6] = [
+const ICONS: [(&str, &[u8]); 7] = [
     ("icons/search.svg", include_bytes!("../assets/icons/search.svg")),
     ("icons/chevron.svg", include_bytes!("../assets/icons/chevron.svg")),
     ("icons/bookmark.svg", include_bytes!("../assets/icons/bookmark.svg")),
     ("icons/downloaded.svg", include_bytes!("../assets/icons/downloaded.svg")),
     ("icons/check.svg", include_bytes!("../assets/icons/check.svg")),
     ("icons/sidebar.svg", include_bytes!("../assets/icons/sidebar.svg")),
+    ("icons/download.svg", include_bytes!("../assets/icons/download.svg")),
 ];
 
 impl gpui::AssetSource for Assets {
@@ -128,9 +130,6 @@ pub fn check(size: f32, color: u32) -> impl IntoElement {
     gpui::svg().path("icons/check.svg").flex_none().size(u(size)).text_color(rgb(color))
 }
 
-pub const DISPLAY: &str = "Big Shoulders Display";
-pub const SANS: &str = "IBM Plex Sans";
-pub const MONO: &str = "IBM Plex Mono";
 /// System font for the few Japanese labels, so no CJK font is bundled.
 pub const CJK: &str = "Hiragino Sans";
 
@@ -155,8 +154,8 @@ pub fn heading(title: &str, note: impl Into<SharedString>) -> impl IntoElement {
         .items_end()
         .gap_4()
         .min_w_0()
-        .child(div().flex_none().font_family(DISPLAY).font_weight(FontWeight::EXTRA_BOLD).text_size(u(28.)).child(title.to_uppercase()))
-        .child(div().min_w_0().truncate().pb(u(5.)).font_family(MONO).text_size(u(13.)).text_color(rgb(FAINT)).child(note.into()))
+        .child(div().flex_none().font_family(crate::fonts::display()).font_weight(FontWeight::EXTRA_BOLD).text_size(u(28.)).child(title.to_uppercase()))
+        .child(div().min_w_0().truncate().pb(u(5.)).font_family(crate::fonts::mono()).text_size(u(13.)).text_color(rgb(FAINT)).child(note.into()))
 }
 
 pub fn pill(id: &'static str, label: impl Into<SharedString>, primary: bool) -> gpui::Stateful<gpui::Div> {
@@ -509,7 +508,10 @@ impl Root {
         let (cache, store) = (self.cache.clone(), self.store.clone());
         let reader = cx.new(|cx| Reader::new(source, cache, store, manga, chapters, index, page, window, cx));
         let sub = cx.subscribe_in(&reader, window, |this, reader, _: &ReaderEvent, window, cx| {
-            reader.update(cx, |r, cx| r.release_all(Some(window), cx));
+            reader.update(cx, |r, cx| {
+                r.release_all(Some(window), cx);
+                r.leave_fullscreen(window);
+            });
             this.reader = None;
             sync::run(this.store.clone(), cx);
             this.focus.focus(window, cx);
@@ -524,7 +526,7 @@ impl Root {
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_rem_size(u(16.));
-        let root = div().relative().size_full().flex().bg(rgb(BG)).text_color(rgb(TEXT)).font_family(SANS).text_size(u(14.));
+        let root = div().relative().size_full().flex().bg(rgb(BG)).text_color(rgb(TEXT)).font_family(fonts::sans()).text_size(u(14.));
         if let Some((reader, _)) = &self.reader {
             return root.child(reader.clone()).children(self.check.clone());
         }
@@ -614,13 +616,17 @@ fn main() {
     downloads::set_dir(data_dir.join("downloads"));
     // Kagane serves JPEG XL, which `image` only decodes through this hook.
     jxl_oxide::integration::register_image_decoding_hook();
-    let heap_mb = Store::load(data_dir.join("library.json")).prefs().host_heap_mb.unwrap_or_else(host::auto_heap_mb);
+    fonts::set_dir(data_dir.join("fonts"));
+    let first = Store::load(data_dir.join("library.json"));
+    fonts::choose(&first.prefs().fonts);
+    let heap_mb = first.prefs().host_heap_mb.unwrap_or_else(host::auto_heap_mb);
     let _ = host::LAUNCH_HEAP_MB.set(heap_mb);
     let host = Host::spawn(&host::host_bin(), &data_dir.join("host"), heap_mb)
         .unwrap_or_else(|e| panic!("start extension host {}: {e}", host::host_bin().display()));
 
     gpui_platform::application().with_assets(Assets).run(move |cx: &mut App| {
         load_fonts(cx);
+        fonts::load(cx);
         downloads::init(cx);
         webviews::start(cx, host.clone());
         cx.bind_keys([

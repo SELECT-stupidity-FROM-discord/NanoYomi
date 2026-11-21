@@ -4,11 +4,11 @@
 use crate::images::{self, ImageCache, Picture, picture_size};
 use crate::page_cache;
 use crate::store::{Progress, Store, now_ms};
-use crate::{BG, FAINT, HOVER, LINE, MONO, MUTED, SURFACE, Source, TEXT, drop_images, pill};
+use crate::{BG, FAINT, HOVER, LINE, MUTED, SURFACE, Source, TEXT, drop_images, pill};
 use gpui::{
     AnyElement, Bounds, Context, DispatchPhase, Entity, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
     KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, Render, ScrollStrategy, SharedString, Size, StatefulInteractiveElement, Styled,
+    ParentElement, Pixels, Point, Render, ScrollEvent, ScrollStrategy, SharedString, Size, StatefulInteractiveElement, Styled,
     UniformListScrollHandle, Window, canvas, div, img, list, prelude::FluentBuilder, px, relative, rgb, rgba,
     uniform_list,
 };
@@ -20,6 +20,9 @@ use std::time::{Duration, Instant};
 
 /// Webtoons read better as a column than stretched across a wide window.
 const COLUMN_MAX: f32 = 900.;
+/// What the arrow keys and one mouse-wheel notch scroll in vertical mode.
+const KEY_STEP: f32 = 120.;
+const WHEEL_STEP: f32 = 80.;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
@@ -71,6 +74,14 @@ pub struct Reader {
     scrubbing: bool,
     chapter_menu: bool,
     chapter_scroll: UniformListScrollHandle,
+    /// Pixels still to scroll in vertical mode. Each frame eats a share, so a key or wheel notch glides.
+    glide: f32,
+    glide_at: Instant,
+    /// This reader put the window into fullscreen, so closing it puts the window back.
+    entered_fullscreen: bool,
+    /// The page was decoded before fullscreen settled, so decode it again at the new size.
+    refit: bool,
+    decoded_for: Size<Pixels>,
 }
 
 impl EventEmitter<ReaderEvent> for Reader {}
@@ -117,7 +128,17 @@ impl Reader {
             scrubbing: false,
             chapter_menu: false,
             chapter_scroll: UniformListScrollHandle::new(),
+            glide: 0.,
+            glide_at: Instant::now(),
+            entered_fullscreen: false,
+            refit: false,
+            decoded_for: window.viewport_size(),
         };
+        if this.store.read(cx).prefs().reader_fullscreen && !window.is_fullscreen() {
+            window.toggle_fullscreen();
+            this.entered_fullscreen = true;
+            this.refit = true;
+        }
         this.show_chrome(Duration::from_secs(1), cx);
         this.open_chapter(index, page, cx);
         if crate::demo().is_some() {
@@ -130,6 +151,22 @@ impl Reader {
         self.chrome = true;
         self.chrome_until = Instant::now() + for_;
         self.schedule_hide(cx);
+    }
+
+    /// Puts the window back if opening the reader made it fullscreen.
+    pub fn leave_fullscreen(&mut self, window: &mut Window) {
+        if self.entered_fullscreen && window.is_fullscreen() {
+            window.toggle_fullscreen();
+        }
+        self.entered_fullscreen = false;
+    }
+
+    fn glide_by(&mut self, dy: f32, cx: &mut Context<Self>) {
+        if self.glide == 0. {
+            self.glide_at = Instant::now();
+        }
+        self.glide += dy;
+        cx.notify();
     }
 
     fn extend_chrome(&mut self, cx: &mut Context<Self>) {
@@ -181,6 +218,7 @@ impl Reader {
         self.page = 0;
         self.inflight.clear();
         self.generation += 1;
+        self.glide = 0.;
         self.strip.reset(0);
         self.status = "Loading chapter…".into();
         cx.notify();
@@ -278,6 +316,7 @@ impl Reader {
         self.store.update(cx, |s, cx| s.edit_prefs(cx, |p| p.vertical_reader = vertical));
         self.inflight.clear();
         self.generation += 1;
+        self.glide = 0.;
         if !self.pages.is_empty() {
             self.strip.reset(self.pages.len() + 1);
             self.strip.scroll_to(ListOffset { item_ix: self.page, offset_in_item: px(0.) });
@@ -475,7 +514,7 @@ impl Reader {
         let rail = if vertical { rail.top_0().bottom_0().left(relative(0.5)).w(px(2.)).ml(px(-1.)) } else { rail.left_0().right_0().top(relative(0.5)).h(px(2.)).mt(px(-1.)) };
         let dots = (0..n).filter(|i| i % step == 0 || *i == n - 1).map(|i| dot(i, 5., if i <= self.page { MUTED } else { LINE }));
         let label = self.scrubbing.then(|| {
-            let l = div().absolute().font_family(MONO).text_size(crate::u(12.)).text_color(rgb(TEXT)).bg(rgb(SURFACE)).px_1().rounded(crate::u(4.)).whitespace_nowrap().child(format!("{}", self.page + 1));
+            let l = div().absolute().font_family(crate::fonts::mono()).text_size(crate::u(12.)).text_color(rgb(TEXT)).bg(rgb(SURFACE)).px_1().rounded(crate::u(4.)).whitespace_nowrap().child(format!("{}", self.page + 1));
             if vertical { l.right(crate::u(30.)).top(at(self.page)).mt(crate::u(-9.)) } else { l.bottom(crate::u(22.)).left(at(self.page)).ml(crate::u(-12.)) }
         });
 
@@ -607,18 +646,15 @@ impl Reader {
             (_, "escape") if self.chapter_menu => self.toggle_chapter_menu(cx),
             (_, "escape") => cx.emit(ReaderEvent::Close),
             (_, "v") => self.toggle_mode(window, cx),
+            (_, "f") => window.toggle_fullscreen(),
+            (_, "left") => self.prev_chapter(cx),
+            (_, "right") => self.next_chapter(cx),
             (Mode::Paged, "space" | "pagedown" | "down") => self.go(1, window, cx),
             (Mode::Paged, "pageup" | "up") => self.go(-1, window, cx),
-            (Mode::Paged, "right") => self.go(self.forward(), window, cx),
-            (Mode::Paged, "left") => self.go(-self.forward(), window, cx),
-            (Mode::Vertical, "space" | "pagedown" | "down" | "right") => {
-                self.strip.scroll_by(px(screen));
-                cx.notify();
-            }
-            (Mode::Vertical, "pageup" | "up" | "left") => {
-                self.strip.scroll_by(px(-screen));
-                cx.notify();
-            }
+            (Mode::Vertical, "down") => self.glide_by(KEY_STEP, cx),
+            (Mode::Vertical, "up") => self.glide_by(-KEY_STEP, cx),
+            (Mode::Vertical, "space" | "pagedown") => self.glide_by(screen, cx),
+            (Mode::Vertical, "pageup") => self.glide_by(-screen, cx),
             _ => {}
         }
     }
@@ -696,6 +732,11 @@ impl Reader {
     }
 }
 
+/// How much of the remaining glide to scroll this frame. About 90 ms to settle, whatever the frame rate.
+fn glide_step(remaining: f32, dt: f32) -> f32 {
+    remaining * (1. - (-dt.min(0.05) / 0.09).exp())
+}
+
 fn scrub_index(t: f32, n: usize) -> usize {
     (t.clamp(0., 1.) * (n - 1) as f32).round() as usize
 }
@@ -723,6 +764,31 @@ impl Render for Reader {
         self.viewport = window.viewport_size();
         self.scale = window.scale_factor();
         let len = self.pages.len();
+
+        if self.glide != 0. {
+            let now = Instant::now();
+            let step = glide_step(self.glide, now.duration_since(self.glide_at).as_secs_f32());
+            self.glide_at = now;
+            self.strip.scroll_by(px(step));
+            self.glide -= step;
+            if self.glide.abs() < 0.5 {
+                self.glide = 0.;
+            } else {
+                window.request_animation_frame();
+            }
+        }
+
+        // Pages are decoded to fit the window, so redo them once fullscreen has its real size.
+        if self.refit && window.is_fullscreen() && self.viewport != self.decoded_for {
+            self.refit = false;
+            self.decoded_for = self.viewport;
+            if len > 0 {
+                self.release_all(Some(window), cx);
+                self.inflight.clear();
+                self.generation += 1;
+                self.sync(Some(window), cx);
+            }
+        }
 
         // In vertical mode the reading position is the page at the top.
         if self.mode == Mode::Vertical && len > 0 {
@@ -768,11 +834,26 @@ impl Render for Reader {
                 .into_any_element(),
             Mode::Vertical => {
                 let this = cx.entity();
+                let entity = this.downgrade();
+                // A wheel notch is 20 px in GPUI's list, which jumps. Notches glide instead, and trackpads keep scrolling natively.
+                let wheel = canvas(|_, _, _| (), move |bounds, _, window, _| {
+                    let e = entity.clone();
+                    window.on_mouse_event(move |ev: &ScrollEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Capture && !ev.delta.precise() && bounds.contains(&ev.position) && e.read_with(cx, |r, _| !r.chapter_menu).unwrap_or(false) {
+                            cx.stop_propagation();
+                            let dy = -f32::from(ev.delta.pixel_delta(px(WHEEL_STEP)).y);
+                            let _ = e.update(cx, |r, cx| r.glide_by(dy, cx));
+                        }
+                    });
+                })
+                .absolute()
+                .size_full();
                 div()
                     .id("strip")
                     .size_full()
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_chrome(cx)))
                     .child(list(self.strip.clone(), move |ix, _window, cx| this.update(cx, |this, cx| this.strip_item(ix, cx))).size_full())
+                    .child(wheel)
                     .into_any_element()
             }
         };
@@ -780,8 +861,8 @@ impl Render for Reader {
         let chapter: SharedString = self.chapters[self.chapter]["name"].as_str().unwrap_or("Chapter").to_string().into();
         let position = if len == 0 { String::new() } else { format!("p.{} / {}", self.page + 1, len) };
         let keys = match self.mode {
-            Mode::Paged => "← → turn · V mode · esc close",
-            Mode::Vertical => "↑ ↓ scroll · V mode · esc close",
+            Mode::Paged => "↑ ↓ page · ← → chapter · F fullscreen · esc close",
+            Mode::Vertical => "↑ ↓ scroll · ← → chapter · F fullscreen · esc close",
         };
 
         let mut root = div()
@@ -850,7 +931,7 @@ impl Render for Reader {
         };
         let (has_prev, has_next) = (self.chapter + 1 < self.chapters.len(), self.chapter > 0);
         let paged = self.mode == Mode::Paged;
-        let corner = |id: &'static str| div().id(id).absolute().bottom(crate::u(28.)).flex().flex_col().gap_1().font_family(MONO).text_size(crate::u(12.)).text_color(rgb(FAINT)).bg(rgba(0x0D0C0BB0)).px_2().py_1().rounded(crate::u(4.));
+        let corner = |id: &'static str| div().id(id).absolute().bottom(crate::u(28.)).flex().flex_col().gap_1().font_family(crate::fonts::mono()).text_size(crate::u(12.)).text_color(rgb(FAINT)).bg(rgba(0x0D0C0BB0)).px_2().py_1().rounded(crate::u(4.));
         let hover = |this: &mut Self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>| {
             if *hovered {
                 this.extend_chrome(cx)
@@ -904,6 +985,17 @@ impl Render for Reader {
 #[cfg(test)]
 mod tests {
     use gpui::{px, size};
+
+    #[test]
+    fn glide_eats_a_share_and_settles() {
+        assert_eq!(super::glide_step(100., 0.), 0.);
+        let (mut left, mut frames) = (-100f32, 0);
+        while left.abs() >= 0.5 {
+            left -= super::glide_step(left, 1. / 60.);
+            frames += 1;
+        }
+        assert!(left <= 0. && frames < 60);
+    }
 
     #[test]
     fn scrubber_maps_and_spaces_pages() {

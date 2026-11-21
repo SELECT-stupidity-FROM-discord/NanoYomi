@@ -311,7 +311,7 @@ impl gpui::Render for Downloads {
                         .gap(u(6.))
                         .child(div().flex().items_baseline().gap_3().child(div().flex_none().font_weight(gpui::FontWeight::SEMIBOLD).child(job.title.clone())).child(div().min_w_0().truncate().text_color(rgb(MUTED)).child(job.chapter["name"].as_str().unwrap_or("Chapter").to_string())))
                         .child(div().h(u(3.)).rounded(u(2.)).bg(rgb(LINE)).child(div().h_full().rounded(u(2.)).w(relative(fraction)).bg(rgb(ACCENT))))
-                        .child(div().truncate().font_family(crate::MONO).text_size(u(11.)).text_color(rgb(color)).child(text)),
+                        .child(div().truncate().font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(color)).child(text)),
                 )
                 .child(button("cancel", "Cancel").id(("cancel", i)).on_click(cx.listener(move |this, _, _, cx| this.cancel(&url, cx))))
         });

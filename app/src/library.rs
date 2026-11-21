@@ -8,7 +8,7 @@ use crate::registry::Registry;
 use crate::store::{Series, Store, ago, now_ms};
 use crate::segmented::Segmented;
 use gpui::AnimationExt;
-use crate::{ACCENT, ACCENT_TEXT, FAINT, LINE, MONO, MUTED, RULE, SURFACE, Source, TEXT, heading, pill};
+use crate::{ACCENT, ACCENT_TEXT, FAINT, LINE, MUTED, RULE, SURFACE, Source, TEXT, heading, pill};
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FontWeight, InteractiveElement, IntoElement, ListAlignment, ListState,
     ParentElement, Render, StatefulInteractiveElement, Styled, Subscription, Window, div, list,
@@ -312,7 +312,7 @@ impl Library {
                 } else {
                     day_label(self.drops[i].at)
                 };
-                div().px(u(PAD)).pt(u(28.)).pb(u(10.)).font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).child(label).into_any_element()
+                div().px(u(PAD)).pt(u(28.)).pb(u(10.)).font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child(label).into_any_element()
             }
             Some(Item::Drops(start, end)) => {
                 let w = self.drop_w;
@@ -324,7 +324,7 @@ impl Library {
     }
 
     fn section_title(text: &'static str) -> impl IntoElement {
-        div().font_family(MONO).text_size(u(13.)).font_weight(FontWeight::MEDIUM).text_color(rgb(MUTED)).child(text)
+        div().font_family(crate::fonts::mono()).text_size(u(13.)).font_weight(FontWeight::MEDIUM).text_color(rgb(MUTED)).child(text)
     }
 
     fn shelf(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -366,7 +366,7 @@ impl Library {
                                 .flex()
                                 .justify_between()
                                 .gap_2()
-                                .font_family(MONO)
+                                .font_family(crate::fonts::mono())
                                 .text_size(u(11.))
                                 .text_color(rgb(FAINT))
                                 .child(div().truncate().child(s.source_name.clone()))
@@ -540,7 +540,7 @@ impl Library {
                     .flex_none()
                     .flex()
                     .justify_end()
-                    .font_family(MONO)
+                    .font_family(crate::fonts::mono())
                     .text_size(u(12.))
                     .text_color(rgb(ACCENT_TEXT))
                     .map(|d| if unread > 0 { d.child(format!("{unread} new")) } else { d.child(crate::check(16., ACCENT_TEXT)) }),
@@ -601,7 +601,7 @@ impl Library {
             .collect();
         let more = chapters.len().saturating_sub(shown);
         let badge = if fresh.is_empty() {
-            div().font_family(MONO).text_size(u(11.)).text_color(rgb(FAINT)).child("READ")
+            div().font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child("READ")
         } else {
             div()
                 .h(u(22.))
@@ -610,7 +610,7 @@ impl Library {
                 .flex()
                 .items_center()
                 .bg(rgb(ACCENT))
-                .font_family(MONO)
+                .font_family(crate::fonts::mono())
                 .text_size(u(11.))
                 .text_color(rgb(crate::BG))
                 .child(format!("{} NEW", fresh.len()))
@@ -676,7 +676,7 @@ fn card_cover(cover: AnyElement, read: Option<f32>, caught_up: bool) -> impl Int
                     .flex()
                     .items_center()
                     .bg(rgb(if caught_up { 0x0D0C0B } else { ACCENT }))
-                    .font_family(MONO)
+                    .font_family(crate::fonts::mono())
                     .text_size(u(10.5))
                     .text_color(rgb(if caught_up { TEXT } else { 0x0D0C0B }))
                     .child(label),

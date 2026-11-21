@@ -6,7 +6,7 @@ use crate::images::ImageCache;
 use crate::library::Resume;
 use crate::registry::Registry;
 use crate::store::{Series, Store, ago, now_ms};
-use crate::{FAINT, MONO, MUTED, heading};
+use crate::{FAINT, MUTED, heading};
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FontWeight, InteractiveElement, IntoElement, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, Window, div, rgb, uniform_list,
@@ -55,7 +55,7 @@ impl History {
             .child(div().text_size(u(13.)).text_color(rgb(0xC9C1B3)).truncate().child(p.chapter_name.clone()))
             .child(
                 div()
-                    .font_family(MONO)
+                    .font_family(crate::fonts::mono())
                     .text_size(u(12.))
                     .text_color(rgb(FAINT))
                     .truncate()
