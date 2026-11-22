@@ -79,6 +79,8 @@ jobs:
       # ring builds its C with clang for Windows ARM64, which the runner image ships.
       - name: Build app
         working-directory: app
+        env:
+          NANO_VERSION: ${{ github.ref_name }}
         run: cargo build --release --target ${{ matrix.target }}
 
       # The target's JDK is only a source of jmods for jlink, so it needn't run here.
