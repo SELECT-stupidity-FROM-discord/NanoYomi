@@ -104,9 +104,31 @@ pub async fn decode_bytes(
     decode: impl FnOnce(DynamicImage) -> Vec<DynamicImage>,
 ) -> Result<Picture, String> {
     let _slot = DECODE_SLOTS.acquire().await;
-    let image = image::load_from_memory(&bytes).map_err(|e| format!("not an image ({e})"))?;
+    let image = open(&bytes)?;
     drop(bytes);
     Ok(Arc::new(decode(image).into_iter().map(to_render).collect()))
+}
+
+/// The image crate has no AVIF decoder, so those go through rav1d.
+fn open(bytes: &[u8]) -> Result<DynamicImage, String> {
+    if image::guess_format(bytes).is_ok_and(|f| f == image::ImageFormat::Avif) {
+        return avif(bytes);
+    }
+    image::load_from_memory(bytes).map_err(|e| format!("not an image ({e})"))
+}
+
+fn avif(bytes: &[u8]) -> Result<DynamicImage, String> {
+    use avif_decode::{Decoder, Image};
+    let img = Decoder::from_avif(bytes).and_then(|d| d.to_image()).map_err(|e| format!("not an image ({e})"))?;
+    let (w, h, rgba): (usize, usize, Vec<u8>) = match img {
+        Image::Rgb8(i) => (i.width(), i.height(), i.pixels().flat_map(|p| [p.r, p.g, p.b, 255]).collect()),
+        Image::Rgba8(i) => (i.width(), i.height(), i.pixels().flat_map(|p| [p.r, p.g, p.b, p.a]).collect()),
+        Image::Gray8(i) => (i.width(), i.height(), i.pixels().flat_map(|p| [p.value(); 3].into_iter().chain([255])).collect()),
+        Image::Rgb16(i) => (i.width(), i.height(), i.pixels().flat_map(|p| [(p.r >> 8) as u8, (p.g >> 8) as u8, (p.b >> 8) as u8, 255]).collect()),
+        Image::Rgba16(i) => (i.width(), i.height(), i.pixels().flat_map(|p| [(p.r >> 8) as u8, (p.g >> 8) as u8, (p.b >> 8) as u8, (p.a >> 8) as u8]).collect()),
+        Image::Gray16(i) => (i.width(), i.height(), i.pixels().flat_map(|p| [(p.value() >> 8) as u8; 3].into_iter().chain([255])).collect()),
+    };
+    image::RgbaImage::from_raw(w as u32, h as u32, rgba).map(DynamicImage::ImageRgba8).ok_or_else(|| "not an image (AVIF size mismatch)".into())
 }
 
 // `thumbnail` instead of `resize`, which keeps a full-height f32 copy (30-40 MB for one page).
@@ -146,6 +168,14 @@ fn to_render(img: DynamicImage) -> Arc<RenderImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn avif_covers_decode() {
+        let img = open(include_bytes!("../testdata/red.avif")).unwrap().to_rgba8();
+        assert_eq!(img.dimensions(), (16, 24));
+        let p = img.get_pixel(8, 12);
+        assert!(p[0] > 200 && p[1] < 60 && p[2] < 60 && p[3] == 255, "{p:?}");
+    }
 
     fn red(w: u32, h: u32) -> DynamicImage {
         DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(w, h, image::Rgba([255, 0, 0, 255])))
