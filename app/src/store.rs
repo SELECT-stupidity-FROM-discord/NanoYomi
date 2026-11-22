@@ -263,6 +263,12 @@ pub struct Prefs {
     pub reader_fullscreen: bool,
     #[serde(default)]
     pub chapters_oldest_first: bool,
+    #[serde(default)]
+    pub updates_off: bool,
+    #[serde(default)]
+    pub last_update_check: i64,
+    #[serde(default)]
+    pub dismissed_update: String,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -310,6 +316,8 @@ pub struct Store {
     pub sync_status: SyncStatus,
     /// The last tracker update that failed, shown on the series page.
     pub track_error: Option<String>,
+    pub update: Option<crate::update::Update>,
+    pub update_note: &'static str,
 }
 
 pub fn now_ms() -> i64 {
@@ -322,7 +330,7 @@ impl Store {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).map_err(|e| eprintln!("{}: {e}", path.display())).ok())
             .unwrap_or_default();
-        Store { path, data, saving: false, sync_status: SyncStatus::Idle, track_error: None }
+        Store { path, data, saving: false, sync_status: SyncStatus::Idle, track_error: None, update: None, update_note: "" }
     }
 
     pub fn get(&self, source: &str, url: &str) -> Option<&Series> {

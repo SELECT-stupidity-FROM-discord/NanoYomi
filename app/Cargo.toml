@@ -23,6 +23,7 @@ flate2 = "1"
 # Same version GPUI uses, for decoding covers off the main thread.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 jxl-oxide = { version = "0.12", features = ["image"] }
+semver = "1"
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 
 # The WebView2 calls wry doesn't wrap. Same versions wry uses.

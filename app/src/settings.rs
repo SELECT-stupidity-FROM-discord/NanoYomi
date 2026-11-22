@@ -391,6 +391,68 @@ impl Render for Settings {
             )
             .child(div().flex_none().flex().gap(u(6.)).child(full_chip("full-off", "Off", false, self.store.clone())).child(full_chip("full-on", "On", true, self.store.clone())));
 
+        let updates = {
+            let s = self.store.read(cx);
+            let off = s.prefs().updates_off;
+            let (found, note) = (s.update.clone(), s.update_note);
+            let have = crate::update::current().map(|v| v.to_string()).unwrap_or_default();
+            let chip = |id: &'static str, label: &'static str, value: bool| {
+                let store = self.store.clone();
+                small_button(id, label, off == value).on_click(move |_, _, cx| store.update(cx, |s, cx| s.edit_prefs(cx, |p| p.updates_off = value)))
+            };
+            let status = match &found {
+                Some(u) => format!("Nano {} is available", u.version),
+                None if note.is_empty() => format!("You have Nano {have}"),
+                None => note.to_string(),
+            };
+            let store = self.store.clone();
+            div()
+                .w_full()
+                .border_t_1()
+                .border_b_1()
+                .border_color(rgb(RULE))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .w_full()
+                        .py(u(14.))
+                        .flex()
+                        .items_center()
+                        .gap_4()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(u(4.))
+                                .child(div().text_size(u(15.)).font_weight(FontWeight::SEMIBOLD).child("Check for updates"))
+                                .child(div().text_size(u(13.)).text_color(rgb(MUTED)).child("Look for a new Nano release when the app starts, at most once a day. A banner links to the download. Nothing is installed for you.")),
+                        )
+                        .child(div().flex_none().flex().gap(u(6.)).child(chip("updates-off", "Off", true)).child(chip("updates-on", "On", false))),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .py(u(14.))
+                        .border_t_1()
+                        .border_color(rgb(RULE))
+                        .flex()
+                        .items_center()
+                        .gap_4()
+                        .child(div().flex_1().min_w_0().font_family(fonts::mono()).text_size(u(13.)).child(status))
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .gap(u(8.))
+                                .children(found.map(|u| small_button("update-download", "Download", true).on_click(move |_, _, cx| cx.open_url(&u.url))))
+                                .child(small_button("update-check", "Check now", false).on_click(move |_, _, cx| crate::update::check(store.clone(), true, cx))),
+                        ),
+                )
+        };
+
         let font_rows = fonts::SLOTS.into_iter().enumerate().map(|(slot, (key, label, default))| {
             let current = self.store.read(cx).prefs().fonts.get(key).cloned();
             let open = self.font_open == Some(slot);
@@ -686,6 +748,9 @@ impl Render for Settings {
             .child(sync)
             .child(div().pt(u(24.)).pb(u(10.)).font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child("BACKUP"))
             .child(backup)
+            .when(crate::update::current().is_some(), |d| {
+                d.child(div().pt(u(24.)).pb(u(10.)).font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child("UPDATES")).child(updates)
+            })
             .child(div().pt(u(24.)).pb(u(10.)).font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).child("CLOUDFLARE"))
             .child(
                 div()

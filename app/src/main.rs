@@ -28,6 +28,7 @@ mod store;
 mod sync;
 mod track;
 mod tracking;
+mod update;
 mod webviews;
 
 use browse::{Browse, OpenManga};
@@ -341,6 +342,7 @@ struct Root {
     palette: Option<palette::Palette>,
     /// A site check or sign-in shown over the window.
     check: Option<Entity<challenge::Check>>,
+    banner: Entity<update::Banner>,
     /// The series panel that's sliding shut, kept until it's out of sight.
     closing: Option<Entity<MangaView>>,
     /// Bumped each time the panel opens or closes, or the sidebar folds, so their slides start over.
@@ -383,6 +385,15 @@ impl Root {
         };
         let focus = cx.focus_handle();
         focus.focus(window, cx);
+        let banner = cx.new(|cx| update::Banner::new(store.clone(), cx));
+        cx.spawn({
+            let store = store.clone();
+            async move |_, cx| {
+                cx.background_executor().timer(std::time::Duration::from_secs(5)).await;
+                cx.update(|cx| update::check(store, false, cx));
+            }
+        })
+        .detach();
         let settings = (tab == Tab::Settings).then(|| {
             let store = store.clone();
             cx.new(|cx| settings::Settings::new(store, cx))
@@ -395,7 +406,7 @@ impl Root {
             let (store, registry, cache) = (store.clone(), registry.clone(), cache.clone());
             cx.new(|cx| History::new(store, registry, cache, cx))
         });
-        Root { cache, store, registry, tab, library, browse, global, catalog, history, settings, manga: None, migrate: None, reader: None, palette: None, check: None, closing: None, panel_moves: 0, sidebar_moves: 0, focus, _subs: subs }
+        Root { cache, store, registry, tab, library, browse, global, catalog, history, settings, manga: None, migrate: None, reader: None, palette: None, check: None, banner, closing: None, panel_moves: 0, sidebar_moves: 0, focus, _subs: subs }
     }
 
     fn zoom_by(&mut self, delta: f32, cx: &mut Context<Self>) {
@@ -585,6 +596,7 @@ impl Render for Root {
             .children(panel)
             .children(self.palette(cx))
             .children(self.check.clone())
+            .children(self.check.is_none().then(|| self.banner.clone()))
     }
 }
 
