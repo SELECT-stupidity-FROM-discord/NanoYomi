@@ -40,6 +40,17 @@ jobs:
 
       - run: rustup target add ${{ matrix.target }}
 
+      # The AVIF decoder's x86 assembly is built with NASM. ARM builds are plain Rust.
+      - name: NASM
+        if: startsWith(matrix.target, 'x86_64')
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) sudo apt-get install -y nasm ;;
+            macOS) brew install nasm ;;
+            Windows) choco install nasm -y && echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH" ;;
+          esac
+
       # GPUI needs Wayland, X11, xkbcommon and fontconfig; wry needs WebKitGTK. ARM64 takes the arm64 packages
       # beside the native ones (Ubuntu multiarch) and a cross linker.
       - name: Linux packages
