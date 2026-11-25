@@ -434,13 +434,21 @@ impl Library {
             .child(if self.shelves.is_empty() {
                 Self::section_title("EVERYTHING").into_any_element()
             } else {
-                self.shelf_switch
-                    .render("shelf", cx.listener(|this, i: &usize, _, cx| {
-                        this.shelf_switch.pick(*i);
-                        this.category = if *i == 0 { None } else { this.shelves.get(*i - 1).map(|c| c.order) };
-                        this.relayout = true;
-                        cx.notify();
-                    }))
+                div()
+                    .id("Categories")
+                    .flex()
+                    .w_full()
+                    .min_w_0()
+                    .overflow_x_scroll()
+                    .child(
+                        self.shelf_switch
+                            .render("shelf", cx.listener(|this, i: &usize, _, cx| {
+                                this.shelf_switch.pick(*i);
+                                this.category = if *i == 0 { None } else { this.shelves.get(*i - 1).map(|c| c.order) };
+                                this.relayout = true;
+                                cx.notify();
+                            }))
+                    )
                     .into_any_element()
             })
             .child(div().ml_auto().flex().flex_wrap().gap(u(10.)).child(self.filter_switch.render("filter", cx.listener(|this, i: &usize, _, cx| {
