@@ -602,7 +602,7 @@ impl Library {
                                     .gap(u(14.))
                                     .pb(u(6.))
                                     .overflow_x_scroll()
-                                    .overflow_y_hidden()
+                                    .restrict_scroll_to_axis()
                                     .track_scroll(&self.shelf_scroll)
                                     .children(cards),
                             )
