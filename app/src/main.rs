@@ -188,6 +188,109 @@ pub fn pill(id: &'static str, label: impl Into<SharedString>, primary: bool) -> 
     }
 }
 
+pub(crate) struct Tip(pub SharedString);
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(u(8.))
+            .py(u(4.))
+            .rounded(u(6.))
+            .bg(rgb(SURFACE))
+            .border_1()
+            .border_color(rgb(LINE))
+            .text_size(u(12.))
+            .text_color(rgb(TEXT))
+            .child(self.0.clone())
+    }
+}
+
+/// Hover-revealed button that clears a series' reading progress from History and Continue reading.
+pub(crate) fn remove_history_button(
+    id: impl Into<gpui::ElementId>,
+    group: &'static str,
+    overlay: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .group("rm-btn")
+        .flex_none()
+        .size(u(24.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .when(overlay, |d| d.absolute().top(u(6.)).right(u(6.)))
+        .invisible()
+        .group_hover(group, |s| s.visible())
+        .tooltip(|_, cx| cx.new(|_| Tip("Remove from history".into())).into())
+        .child(
+            gpui::svg()
+                .path("icons/win-close.svg")
+                .flex_none()
+                .size(u(12.))
+                .text_color(rgb(MUTED))
+                .group_hover("rm-btn", |s| s.size(u(15.)).text_color(rgb(TEXT))),
+        )
+}
+
+/// Shared banner offering Undo after removing items from History or Continue reading.
+pub(crate) fn history_undo_banner(
+    id_prefix: &'static str,
+    store: Entity<Store>,
+    count: usize,
+) -> gpui::AnyElement {
+    let message = if count == 1 {
+        "Removed 1 series from history.".into()
+    } else {
+        format!("Cleared {count} series from history.")
+    };
+    let undo_store = store.clone();
+    div()
+        .px(u(14.))
+        .py(u(10.))
+        .rounded(u(10.))
+        .border_1()
+        .border_color(rgb(LINE))
+        .bg(rgb(SURFACE))
+        .flex()
+        .items_center()
+        .gap(u(12.))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(u(13.))
+                .text_color(rgb(BODY))
+                .child(message),
+        )
+        .child(
+            catalog::small_button(format!("{id_prefix}-undo"), "Undo", true).on_click(
+                move |_, _, cx| {
+                    undo_store.update(cx, |s, cx| s.undo_history(cx));
+                },
+            ),
+        )
+        .child(
+            div()
+                .id(format!("{id_prefix}-dismiss"))
+                .flex_none()
+                .size(u(24.))
+                .rounded(u(12.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .text_color(rgb(MUTED))
+                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                .child(gpui::svg().path("icons/win-close.svg").size(u(12.)))
+                .on_click(move |_, _, cx| {
+                    store.update(cx, |s, cx| s.dismiss_history_undo(cx));
+                }),
+        )
+        .into_any_element()
+}
+
 #[derive(Clone)]
 pub struct Source {
     pub host: Arc<Host>,

@@ -399,14 +399,23 @@ fn outgoing_since(s: &Series, old: Option<&Snapshot>, raw: Option<Raw>, now: i64
     let visible = s.visible();
     let read = s.read_flags(&visible);
     let p = s.progress.as_ref();
-    let reading = p.and_then(|p| visible.iter().position(|c| c["url"] == p.chapter_url.as_str()));
+    let reading = p.and_then(|p| {
+        visible
+            .iter()
+            .position(|c| c["url"] == p.chapter_url.as_str())
+    });
     let progress_moved = old.is_none_or(|o| o.progress != Snapshot::of(s).progress);
     for (i, c) in visible.iter().enumerate() {
         let url = c["url"].as_str().unwrap_or("");
         let current = progress_moved && Some(i) == reading;
         let have = raw.chapters.get(url);
-        let (was_read, page, was_marked) =
-            have.map_or((false, 0, false), |m| (m.bool(C_READ).unwrap_or(false), m.int(C_PAGE), m.bool(C_BOOKMARK).unwrap_or(false)));
+        let (was_read, page, was_marked) = have.map_or((false, 0, false), |m| {
+            (
+                m.bool(C_READ).unwrap_or(false),
+                m.int(C_PAGE),
+                m.bool(C_BOOKMARK).unwrap_or(false),
+            )
+        });
         // Only an explicit unread here clears a read from the phone.
         let unread_here = s.marks.get(url) == Some(&false);
         let send_read = (read[i] && !was_read) || (unread_here && was_read);
@@ -495,25 +504,47 @@ fn track_of(e: &Msg) -> Track {
 
 /// Takes a server series into Nano. The newer reading position wins.
 /// Sync leaves series that are only in history on the server; a restore brings them in with `history`.
-fn incoming(series: &mut Vec<Series>, m: &Msg, raw: Option<Raw>, source_names: &HashMap<String, String>, history: bool) -> Option<(usize, Raw)> {
+fn incoming(
+    series: &mut Vec<Series>,
+    m: &Msg,
+    raw: Option<Raw>,
+    source_names: &HashMap<String, String>,
+    history: bool,
+) -> Option<(usize, Raw)> {
     incoming_from(series, m, raw, source_names, history, false)
 }
 
 /// `v1` skips categories and trackers, which only the new protocol carries.
-fn incoming_from(series: &mut Vec<Series>, m: &Msg, raw: Option<Raw>, source_names: &HashMap<String, String>, history: bool, v1: bool) -> Option<(usize, Raw)> {
+fn incoming_from(
+    series: &mut Vec<Series>,
+    m: &Msg,
+    raw: Option<Raw>,
+    source_names: &HashMap<String, String>,
+    history: bool,
+    v1: bool,
+) -> Option<(usize, Raw)> {
     let source = (m.int(M_SOURCE) as u64).to_string();
     let url = m.str(M_URL);
     let favorite = m.bool(M_FAVORITE).unwrap_or(true); // absent is true in Mihon's encoding
-    let ix = match series.iter().position(|s| s.source == source && s.url() == url) {
+    let ix = match series
+        .iter()
+        .position(|s| s.source == source && s.url() == url)
+    {
         Some(ix) => ix,
         None if favorite || (history && m.all(M_HISTORY).next().is_some()) => {
-            let genre: Vec<String> = m.all(M_GENRE).map(|g| String::from_utf8_lossy(g).into_owned()).collect();
+            let genre: Vec<String> = m
+                .all(M_GENRE)
+                .map(|g| String::from_utf8_lossy(g).into_owned())
+                .collect();
             let manga = json!({
                 "url": url, "title": m.str(M_TITLE), "artist": m.str(M_ARTIST), "author": m.str(M_AUTHOR),
                 "description": m.str(M_DESC), "genre": genre.join(", "), "status": m.int(M_STATUS),
                 "thumbnailUrl": m.str(M_THUMB), "initialized": true,
             });
-            let name = source_names.get(&source).cloned().unwrap_or_else(|| format!("Source {source}"));
+            let name = source_names
+                .get(&source)
+                .cloned()
+                .unwrap_or_else(|| format!("Source {source}"));
             series.push(Series::new(source.clone(), name, manga));
             series.len() - 1
         }
@@ -534,13 +565,22 @@ fn incoming_from(series: &mut Vec<Series>, m: &Msg, raw: Option<Raw>, source_nam
     if favorite && s.added_at == 0 {
         s.added_at = m.int(M_ADDED);
     }
-    let last = m.all(M_HISTORY).filter_map(Msg::parse).max_by_key(|h| h.int(H_READ_AT));
+    let last = m
+        .all(M_HISTORY)
+        .filter_map(Msg::parse)
+        .max_by_key(|h| h.int(H_READ_AT));
     let server = last.map(|h| {
         let url = h.str(H_URL);
         let ch = raw.chapters.get(&url);
         let page = ch.map_or(0, |c| c.int(C_PAGE).max(0) as usize);
         let name = ch.map(|c| c.str(C_NAME)).unwrap_or_default();
-        Progress { chapter_url: url, chapter_name: name, page, pages: page + 1, at: h.int(H_READ_AT) }
+        Progress {
+            chapter_url: url,
+            chapter_name: name,
+            page,
+            pages: page + 1,
+            at: h.int(H_READ_AT),
+        }
     });
     // Read flags and bookmarks from other devices. Absence never clears one, like the rest of sync.
     let visible = s.visible();
@@ -552,7 +592,10 @@ fn incoming_from(series: &mut Vec<Series>, m: &Msg, raw: Option<Raw>, source_nam
         } else if c.bool(C_BOOKMARK) == Some(false) {
             s.bookmarks.remove(&url);
         }
-        let read_here = visible.iter().position(|v| v["url"] == url.as_str()).map(|i| derived[i]);
+        let read_here = visible
+            .iter()
+            .position(|v| v["url"] == url.as_str())
+            .map(|i| derived[i]);
         match c.bool(C_READ) {
             Some(true) if read_here != Some(true) => {
                 s.marks.insert(url, true);
@@ -575,7 +618,7 @@ fn incoming_from(series: &mut Vec<Series>, m: &Msg, raw: Option<Raw>, source_nam
     meta.sent.bookmarks = s.bookmarks.clone();
     if let Some(p) = server {
         meta.sent.progress = Some((p.chapter_url.clone(), p.page, p.at));
-        if s.progress.as_ref().is_none_or(|l| p.at >= l.at) {
+        if p.at > s.history_cleared_at && s.progress.as_ref().is_none_or(|l| p.at >= l.at) {
             s.progress = Some(p);
         }
     }
@@ -851,19 +894,32 @@ fn backup_manga(s: &Series, raw: Option<Raw>) -> Msg {
 
 /// Takes backup series in. Only adds: a series already here stays in the library and keeps its categories,
 /// and sync's own record stays as it was, so restored changes go up on the next sync.
-fn restore_series(series: &mut Vec<Series>, mangas: &[Msg], sources: &HashMap<String, String>) -> usize {
+fn restore_series(
+    series: &mut Vec<Series>,
+    mangas: &[Msg],
+    sources: &HashMap<String, String>,
+) -> usize {
     let mut taken = 0;
     for m in mangas {
         let (source, url) = ((m.int(M_SOURCE) as u64).to_string(), m.str(M_URL));
-        let before = series.iter().find(|s| s.source == source && s.url() == url).cloned();
+        let before = series
+            .iter()
+            .find(|s| s.source == source && s.url() == url)
+            .cloned();
         if let Some((ix, _)) = incoming(series, m, None, sources, true) {
             let s = &mut series[ix];
             if let Some(old) = before {
                 s.in_library |= old.in_library;
-                let added: Vec<i64> = s.categories.iter().copied().filter(|c| !old.categories.contains(c)).collect();
+                let added: Vec<i64> = s
+                    .categories
+                    .iter()
+                    .copied()
+                    .filter(|c| !old.categories.contains(c))
+                    .collect();
                 s.categories = old.categories.into_iter().chain(added).collect();
                 // The backup's unread chapters and missing bookmarks don't undo ones made here.
-                s.marks.extend(old.marks.into_iter().filter(|(_, read)| *read));
+                s.marks
+                    .extend(old.marks.into_iter().filter(|(_, read)| *read));
                 s.bookmarks.extend(old.bookmarks);
                 s.sync = old.sync;
             }
@@ -894,14 +950,21 @@ impl Store {
     }
 
     /// Merges a Mihon or Nano backup into the library. Newer reading progress wins; nothing is removed.
-    pub fn restore(&mut self, bytes: Vec<u8>, cx: &mut gpui::Context<Self>) -> Result<usize, String> {
-        let reply = decode(bytes, 0, false).map_err(|_| "That file isn't a Mihon backup".to_string())?;
+    pub fn restore(
+        &mut self,
+        bytes: Vec<u8>,
+        cx: &mut gpui::Context<Self>,
+    ) -> Result<usize, String> {
+        let reply =
+            decode(bytes, 0, false).map_err(|_| "That file isn't a Mihon backup".to_string())?;
         if reply.mangas.is_empty() {
             return Err("That backup has no series in it".into());
         }
         self.restore_categories(reply.categories.clone());
         let mut taken = 0;
-        self.edit_series(cx, |series| taken = restore_series(series, &reply.mangas, &reply.sources));
+        self.edit_series(cx, |series| {
+            taken = restore_series(series, &reply.mangas, &reply.sources)
+        });
         Ok(taken)
     }
 }
@@ -1115,6 +1178,7 @@ mod tests {
 
         // Read on into /c2 here.
         s.chapters = series().chapters;
+        s.mark(&["/c1".into()], true);
         s.progress = Some(Progress { chapter_url: "/c2".into(), chapter_name: "Ch.2".into(), page: 1, pages: 10, at: 4000 });
         assert!(dirty(s));
         let (out, _) = outgoing(s, Some(raw), 5000);
@@ -1129,6 +1193,83 @@ mod tests {
         assert!(by("/c3").is_none());
         let hist = Msg::parse(out.all(M_HISTORY).next().unwrap()).unwrap();
         assert_eq!((hist.str(H_URL), hist.int(H_READ_AT)), ("/c2".into(), 4000));
+    }
+
+    #[test]
+    fn clearing_history_blocks_older_server_progress_and_allows_newer() {
+        let mut h = Msg::default();
+        h.set_str(H_URL, "/c1");
+        h.set_int(H_READ_AT, 1000);
+        let mut m = new_manga(&series());
+        m.push(M_HISTORY, &h);
+
+        let mut list = vec![];
+        incoming(&mut list, &m, None, &HashMap::new(), false).unwrap();
+        assert!(list[0].progress.is_some());
+
+        crate::store::clear_progress_for(&mut list, "7537715367149829912", "/m", 2000);
+        assert!(list[0].progress.is_none());
+
+        // Older server history does not resurrect cleared progress.
+        incoming(&mut list, &m, None, &HashMap::new(), false).unwrap();
+        assert!(list[0].progress.is_none());
+
+        // Newer progress after the clear comes in normally.
+        let mut newer_h = Msg::default();
+        newer_h.set_str(H_URL, "/c2");
+        newer_h.set_int(H_READ_AT, 3000);
+        let mut newer_m = new_manga(&series());
+        newer_m.push(M_HISTORY, &newer_h);
+        incoming(&mut list, &newer_m, None, &HashMap::new(), false).unwrap();
+        assert_eq!(
+            list[0].progress.as_ref().map(|p| p.chapter_url.as_str()),
+            Some("/c2")
+        );
+    }
+
+    #[test]
+    fn clear_then_sync_then_undo_restores_progress_and_tombstone() {
+        let mut h = Msg::default();
+        h.set_str(H_URL, "/c1");
+        h.set_int(H_READ_AT, 1000);
+        let mut m = new_manga(&series());
+        m.push(M_HISTORY, &h);
+
+        let mut list = vec![];
+        incoming(&mut list, &m, None, &HashMap::new(), false).unwrap();
+        let cleared =
+            crate::store::clear_progress_for(&mut list, "7537715367149829912", "/m", 2000).unwrap();
+
+        // Sync runs while cleared: old server progress stays blocked.
+        incoming(&mut list, &m, None, &HashMap::new(), false).unwrap();
+        assert!(list[0].progress.is_none());
+        assert_eq!(list[0].history_cleared_at, 2000);
+
+        // Undo restores the pre-clear progress and pre-clear tombstone.
+        crate::store::restore_progress_entries(&mut list, vec![cleared]);
+        assert_eq!(
+            list[0]
+                .progress
+                .as_ref()
+                .map(|p| (p.chapter_url.as_str(), p.at)),
+            Some(("/c1", 1000))
+        );
+        assert_eq!(list[0].history_cleared_at, 0);
+
+        // Progress newer than the restored 1000 (still below the old 2000 clear) is accepted again.
+        let mut mid_h = Msg::default();
+        mid_h.set_str(H_URL, "/c2");
+        mid_h.set_int(H_READ_AT, 1500);
+        let mut mid_m = new_manga(&series());
+        mid_m.push(M_HISTORY, &mid_h);
+        incoming(&mut list, &mid_m, None, &HashMap::new(), false).unwrap();
+        assert_eq!(
+            list[0]
+                .progress
+                .as_ref()
+                .map(|p| (p.chapter_url.as_str(), p.at)),
+            Some(("/c2", 1500))
+        );
     }
 
     #[test]
@@ -1188,6 +1329,7 @@ mod tests {
 
         // Here: unread /c3 again, bookmark /c0, unbookmark /c2.
         s.mark(&["/c3".into()], false);
+        s.mark(&["/c0".into()], true);
         s.toggle_bookmark("/c0");
         s.toggle_bookmark("/c2");
         let (out, _) = outgoing(s, Some(raw), 9000);
@@ -1226,6 +1368,7 @@ mod tests {
         s.added_at = 1234;
         s.categories = vec![2];
         s.progress = Some(Progress { chapter_url: "/c1".into(), chapter_name: "Ch.1".into(), page: 4, pages: 9, at: 777 });
+        s.mark(&["/c0".into()], true);
         s.bookmarks.insert("/c3".into());
         s.tracks.push(Track { tracker: 2, media_id: 30, status: 1, ..Track::default() });
         let m = backup_manga(&s, None);
@@ -1281,7 +1424,8 @@ mod tests {
         let mut list = vec![];
         assert!(incoming(&mut list, &m, None, &HashMap::new(), false).is_none());
         assert!(list.is_empty());
-        let (ix, _) = incoming(&mut list, &m, None, &HashMap::new(), true).expect("a restore keeps history");
+        let (ix, _) =
+            incoming(&mut list, &m, None, &HashMap::new(), true).expect("a restore keeps history");
         assert!(!list[ix].in_library && list[ix].progress.is_some());
     }
     #[test]
@@ -1309,6 +1453,7 @@ mod tests {
         let s = &mut list[0];
         assert!(!dirty1(s), "just came from there");
         s.chapters = series().chapters;
+        s.mark(&["/c1".into()], true);
         s.progress = Some(Progress { chapter_url: "/c2".into(), chapter_name: "Ch.2".into(), page: 1, pages: 10, at: 4000 });
         assert!(dirty1(s));
 

@@ -122,6 +122,8 @@ pub struct Library {
     shown: Vec<usize>,
     /// Indexes into `series` for Continue reading.
     shelf: Vec<usize>,
+    shelf_shape: (bool, bool),
+    undo_count: usize,
     /// Bumped whenever the store changes. Rebuilding the library clones every series and chapter, so that only
     /// happens when this or the filter, sort, category or page changes, not on every frame.
     data_gen: u64,
@@ -188,6 +190,8 @@ impl Library {
             kept: 0,
             shown: vec![],
             shelf: vec![],
+shelf_shape: (false, false),
+            undo_count: 0,
             data_gen: 0,
             built: None,
             unread_total: 0,
@@ -348,9 +352,14 @@ impl Library {
             let image = self.cover_of(ix, cx);
             let s = &self.series[ix];
             let p = s.progress.clone().unwrap_or_else(|| unreachable!());
-            let page = if p.pages == 0 { 0. } else { ((p.page + 1) as f32 / p.pages as f32).min(1.) };
+                let page = if p.pages == 0 {
+                    0.
+                } else {
+                    ((p.page + 1) as f32 / p.pages as f32).min(1.)
+                };
             div()
                 .id(("shelf", ix))
+                    .group("shelf-card")
                 .w(u(w))
                 .flex_none()
                 .flex()
@@ -380,6 +389,12 @@ impl Library {
                         .flex_col()
                         .gap(u(5.))
                         .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(u(6.))
+                                    .child(
+                                        div().flex_1().min_w_0().child(
                             div()
                                 .id(("shelf-title", ix))
                                 .self_start()
@@ -392,10 +407,50 @@ impl Library {
                                     this.open(ix, cx);
                                     cx.stop_propagation();
                                 })),
+                                        ),
+                                    )
+                                    .child(
+                                        crate::remove_history_button(
+                                            ("shelf-rm", ix),
+                                            "shelf-card",
+                                            false,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                let (source, url) = {
+                                                    let s = &this.series[ix];
+                                                    (s.source.clone(), s.url().to_string())
+                                                };
+                                                this.store.update(cx, |store, cx| {
+                                                    store.remove_from_history(&source, &url, cx);
+                                                });
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(u(13.))
+                                    .text_color(rgb(MUTED))
+                                    .truncate()
+                                    .child(format!(
+                                        "{} · page {} of {}",
+                                        p.chapter_name,
+                                        p.page + 1,
+                                        p.pages
+                                    )),
                         )
-                        .child(div().text_size(u(13.)).text_color(rgb(MUTED)).truncate().child(format!("{} · page {} of {}", p.chapter_name, p.page + 1, p.pages)))
                         .child(div().flex_1())
-                        .child(div().h(u(3.)).rounded(u(2.)).bg(rgb(LINE)).child(div().h_full().rounded(u(2.)).w(relative(page)).bg(rgb(ACCENT))))
+                            .child(
+                                div().h(u(3.)).rounded(u(2.)).bg(rgb(LINE)).child(
+                                    div()
+                                        .h_full()
+                                        .rounded(u(2.))
+                                        .w(relative(page))
+                                        .bg(rgb(ACCENT)),
+                                ),
+                            )
                         .child(
                             div()
                                 .flex()
@@ -410,15 +465,26 @@ impl Library {
                 )
                 .on_click(cx.listener(move |this, _, _, cx| this.resume(ix, None, cx)))
                 .into_any_element()
-        }).collect();
+            })
+            .collect();
+        let undo_count = self.undo_count;
         div()
             .px(u(PAD))
             .pt(u(30.))
             .flex()
             .flex_col()
             .gap(u(14.))
-            .child(Self::section_title("CONTINUE READING"))
+            .when(!cards.is_empty(), |d| {
+                d.child(Self::section_title("CONTINUE READING"))
             .child(div().flex().gap(u(14.)).children(cards))
+            })
+            .when(undo_count > 0, |d| {
+                d.child(crate::history_undo_banner(
+                    "lib",
+                    self.store.clone(),
+                    undo_count,
+                ))
+            })
             .into_any_element()
     }
 
@@ -739,6 +805,8 @@ impl Render for Library {
         let width = crate::content_width(window);
         self.width = width;
         (self.cols, self.card_w) = grid(width, PAD, GAP, CARD_W);
+let undo_count = self.store.read(cx).history_undo().len();
+        self.undo_count = undo_count;
         let key = (self.data_gen, self.updates_page, self.category, self.filter, self.sort);
         if self.built != Some(key) {
             let store = self.store.read(cx);
@@ -840,7 +908,12 @@ impl Render for Library {
                 start = end;
             }
         } else {
-            if !self.shelf.is_empty() {
+            let shape = (!self.shelf.is_empty(), undo_count > 0);
+            if self.shelf_shape != shape {
+                self.shelf_shape = shape;
+                self.list.remeasure();
+            }
+            if shape.0 || shape.1 {
                 items.push(Item::Shelf);
             }
             if self.library_len == 0 {

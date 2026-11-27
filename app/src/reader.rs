@@ -221,6 +221,11 @@ impl Reader {
         let source = self.source.clone();
         let chapter = self.chapters[index].clone();
         let title = self.manga["title"].as_str().unwrap_or_default().to_string();
+        let url = chapter["url"].as_str().unwrap_or_default();
+        let unread = self.store.read(cx)
+        .get(&self.source.id, self.manga["url"].as_str().unwrap_or_default())
+        .is_some_and(|s| s.marks.get(url) == Some(&false));
+        let start = if unread { 0 } else { start };
         cx.spawn(async move |this, cx| {
             // A downloaded chapter reads from disk, with no network at all.
             let local = { let (source, chapter) = (source.clone(), chapter.clone()); cx.background_executor().spawn(async move { crate::downloads::local_pages(&source, &title, &chapter) }).await };
@@ -357,6 +362,7 @@ impl Reader {
     /// Saving the position also puts the series in History.
     fn save_progress(&mut self, cx: &mut Context<Self>) {
         let ch = &self.chapters[self.chapter];
+        let finished = !self.pages.is_empty() && self.page + 1 >= self.pages.len();
         let progress = Progress {
             chapter_url: ch["url"].as_str().unwrap_or_default().to_string(),
             chapter_name: ch["name"].as_str().unwrap_or("Chapter").to_string(),
@@ -369,6 +375,9 @@ impl Reader {
             store.update(&source.id, &source.name, &manga, cx, |s| {
                 if s.chapters.len() != chapters.len() {
                     s.chapters = chapters.to_vec();
+                }
+                if finished && !progress.chapter_url.is_empty() {
+                    s.marks.insert(progress.chapter_url.clone(), true);
                 }
                 s.progress = Some(progress);
             })
