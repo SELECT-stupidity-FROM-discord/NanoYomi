@@ -13,6 +13,7 @@ mod host;
 mod images;
 mod input;
 mod library;
+mod ln;
 mod manga;
 mod migrate;
 mod page_cache;

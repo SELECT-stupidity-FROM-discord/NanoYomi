@@ -1,0 +1,8 @@
+{
+  "name": "nano-ln-runtime",
+  "private": true,
+  "description": "Bundles the libraries LNReader plugins require into one script for QuickJS",
+  "scripts": { "build": "esbuild entry.js --bundle --format=iife --platform=browser --conditions=browser --main-fields=browser,module,main --target=es2020 --minify --legal-comments=none --outfile=../runtime.js" },
+  "dependencies": { "cheerio": "1.0.0", "dayjs": "1.11.13", "htmlparser2": "9.1.0" },
+  "devDependencies": { "esbuild": "0.24.0" }
+}
