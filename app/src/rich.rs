@@ -153,7 +153,7 @@ pub fn parse(src: &str) -> Vec<Block> {
 }
 
 /// GPUI wants highlight ranges in order and not overlapping, so split at every edge.
-fn highlights(b: &Block) -> Vec<(Range<usize>, HighlightStyle)> {
+pub fn highlights(b: &Block) -> Vec<(Range<usize>, HighlightStyle)> {
     let mut edges: Vec<usize> = b.bold.iter().chain(b.italic.iter()).chain(b.links.iter().map(|l| &l.0)).flat_map(|r| [r.start, r.end]).collect();
     edges.sort();
     edges.dedup();
@@ -188,7 +188,7 @@ fn is_rtl_char(c: char) -> bool {
 }
 
 /// True when the paragraph is mostly right-to-left letters.
-fn is_rtl_block(s: &str) -> bool {
+pub(crate) fn is_rtl_block(s: &str) -> bool {
     let (mut rtl, mut other) = (0usize, 0usize);
     for c in s.chars().filter(|c| c.is_alphabetic()) {
         if is_rtl_char(c) { rtl += 1 } else { other += 1 }
@@ -241,7 +241,7 @@ fn clip(rs: &[Range<usize>], r: &Range<usize>) -> Vec<Range<usize>> {
 
 /// An RTL paragraph as short, separately shaped tokens laid out right-to-left,
 /// so gpui never has to wrap RTL text itself.
-fn render_rtl_block(block_ix: usize, b: &Block) -> impl IntoElement {
+pub(crate) fn render_rtl_block(block_ix: usize, b: &Block) -> impl IntoElement {
     let items: Vec<_> =
         rtl_tokens(&b.text)
             .into_iter()

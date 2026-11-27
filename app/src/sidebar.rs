@@ -7,7 +7,7 @@ use gpui::{Animation, AnimationExt, StyledImage};
 pub const WIDE: f32 = 232.;
 pub const NARROW: f32 = 64.;
 
-struct Tip(SharedString);
+pub(crate) struct Tip(pub SharedString);
 
 struct Dragged(String);
 
@@ -18,7 +18,7 @@ impl Render for Tip {
 }
 
 /// A row with a short label that stays when collapsed and a long one that hides.
-fn item(id: impl Into<gpui::ElementId>, short: AnyElement, label: SharedString, on: bool, narrow: bool) -> gpui::Stateful<gpui::Div> {
+pub(crate) fn item(id: impl Into<gpui::ElementId>, short: AnyElement, label: SharedString, on: bool, narrow: bool) -> gpui::Stateful<gpui::Div> {
     let tip = label.clone();
     div()
         .id(id)
@@ -52,7 +52,7 @@ fn grip() -> impl IntoElement {
         .child(dots())
 }
 
-fn ja(text: &'static str, on: bool, narrow: bool) -> AnyElement {
+pub(crate) fn ja(text: &'static str, on: bool, narrow: bool) -> AnyElement {
     div()
         .font_family(CJK)
         .text_size(u(if narrow { 12. } else { 11. }))
@@ -62,11 +62,80 @@ fn ja(text: &'static str, on: bool, narrow: bool) -> AnyElement {
         .into_any_element()
 }
 
-fn label(text: &'static str) -> impl IntoElement {
+pub(crate) fn label(text: &'static str) -> impl IntoElement {
     div().flex_none().px(u(10.)).pb(u(6.)).font_family(crate::fonts::mono()).text_size(u(10.5)).text_color(rgb(FAINT)).child(text)
 }
 
+const MODE_IN: u64 = 480;
+const MODE_OUT: u64 = 480;
+
+/// The cover that fades over the window while Nano swaps between manga and light novels.
+#[derive(Clone, Copy)]
+pub struct ModeAnim {
+    to_ln: bool,
+    started: std::time::Instant,
+    out_at: Option<std::time::Instant>,
+}
+
 impl Root {
+    /// Covers the window, swaps the mode underneath, then lifts the cover.
+    pub(crate) fn switch_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode_anim.is_some() {
+            return;
+        }
+        let to = !self.store.read(cx).prefs().ln;
+        self.mode_anim = Some(ModeAnim { to_ln: to, started: std::time::Instant::now(), out_at: None });
+        cx.notify();
+        self._mode_task = cx.spawn_in(window, async move |this, cx| {
+            let ms = std::time::Duration::from_millis;
+            cx.background_executor().timer(ms(MODE_IN)).await;
+            this.update_in(cx, |this, window, cx| {
+                if to {
+                    this.make_ln(window, cx);
+                }
+                this.store.update(cx, |s, cx| s.edit_prefs(cx, |p| p.ln = to));
+                this.tab = Tab::Library;
+                this.close_manga(cx);
+                if let Some(a) = &mut this.mode_anim {
+                    a.out_at = Some(std::time::Instant::now());
+                }
+            })
+            .ok();
+            cx.background_executor().timer(ms(MODE_OUT + 20)).await;
+            this.update(cx, |this, cx| {
+                this.mode_anim = None;
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    pub(crate) fn mode_overlay(&self, window: &mut Window) -> Option<impl IntoElement> {
+        let a = self.mode_anim?;
+        window.request_animation_frame();
+        let since = |t: std::time::Instant| t.elapsed().as_secs_f32() * 1000.;
+        let ramp = |from: f32, len: f32| gpui::ease_in_out(((since(a.started) - from) / len).clamp(0., 1.));
+        let out = a.out_at.map_or(0., |t| gpui::ease_in_out((since(t) / MODE_OUT as f32).clamp(0., 1.)));
+        let cover = ramp(0., MODE_IN as f32) * (1. - out);
+        let word = ramp(120., 360.) * (1. - out);
+        Some(
+            div()
+                .id("mode-splash")
+                .occlude()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(u(8.))
+                .bg(rgb(BG))
+                .opacity(cover)
+                .child(div().opacity(word).font_family(crate::fonts::display()).font_weight(FontWeight::BLACK).text_size(u(44.)).child("NANO"))
+                .child(div().opacity(word).font_family(crate::fonts::mono()).text_size(u(13.)).text_color(rgb(ACCENT_TEXT)).child(if a.to_ln { "LIGHT NOVELS" } else { "MANGA" })),
+        )
+    }
+
     pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         let on = !self.store.read(cx).prefs().sidebar_collapsed;
         self.store.update(cx, |s, cx| s.edit_prefs(cx, |p| p.sidebar_collapsed = on));
@@ -274,7 +343,8 @@ impl Root {
                     .gap(u(2.))
                     .child(nav(Tab::Downloads, "保存", "Downloads", cx))
                     .child(nav(Tab::Extensions, "拡張", "Extensions", cx))
-                    .child(nav(Tab::Settings, "設定", "Settings", cx)),
+                    .child(nav(Tab::Settings, "設定", "Settings", cx))
+                    .child(item("side-mode", ja("切替", false, narrow), "Switch to LN".into(), false, narrow).on_click(cx.listener(|this, _, window, cx| this.switch_mode(window, cx)))),
             )
             .children(sync.map(|(color, text)| {
                 div()

@@ -3,10 +3,10 @@
 use futures::channel::oneshot;
 use rquickjs::{CatchResultExt, CaughtError, Context, Ctx, Error, Function, Promise, Runtime, function::Opt};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, LazyLock, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// cheerio, htmlparser2, dayjs and the browser pieces plugins expect, bundled by `ln/js`.
@@ -14,6 +14,52 @@ const RUNTIME: &str = include_str!("../../ln/runtime.js");
 
 /// One call may take this long before the plugin is cut off.
 const LIMIT: Duration = Duration::from_secs(90);
+
+/// A call that failed behind a Cloudflare check starts its error with this, then the address to open.
+const CLOUDFLARE: &str = "NANO_CLOUDFLARE ";
+
+pub fn challenge_url(error: &str) -> Option<&str> {
+    error.strip_prefix(CLOUDFLARE)
+}
+
+/// What a passed check left behind. Cloudflare ties its cookie to the browser that passed, so the user agent travels with it.
+struct Clearance {
+    cookies: Vec<String>,
+    user_agent: String,
+}
+
+static JAR: LazyLock<Mutex<HashMap<String, Clearance>>> = LazyLock::new(Mutex::default);
+
+/// The site a cookie covers: the last two labels of the host, so `www.` and `api.` share it.
+fn site_key(url: &str) -> String {
+    let host = url.split("//").nth(1).unwrap_or(url).split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or("").split(':').next().unwrap_or("").to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').collect();
+    labels[labels.len().saturating_sub(2)..].join(".")
+}
+
+/// Remembers the cookies and agent a web view passed a check with, for this site's later requests.
+pub fn keep_clearance(url: &str, set_cookies: Vec<String>, user_agent: &str) {
+    let cookies = set_cookies.iter().filter_map(|c| c.split(';').next()).map(|c| c.trim().to_string()).filter(|c| c.contains('=')).collect();
+    JAR.lock().unwrap().insert(site_key(url), Clearance { cookies, user_agent: user_agent.to_string() });
+}
+
+fn is_challenge(status: u16, headers: &[(String, String)], body: &[u8]) -> bool {
+    if !matches!(status, 403 | 429 | 503) {
+        return false;
+    }
+    let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.to_ascii_lowercase());
+    if header("cf-mitigated").as_deref() == Some("challenge") {
+        return true;
+    }
+    let head = String::from_utf8_lossy(&body[..body.len().min(20_000)]).to_ascii_lowercase();
+    header("server").is_some_and(|s| s.contains("cloudflare")) && ["just a moment", "challenge-platform", "cf-chl", "attention required"].iter().any(|m| head.contains(m))
+}
+
+/// A plugin that swallows the failure and returns nothing looks the same as one that found nothing.
+fn looks_empty(json: &str) -> bool {
+    matches!(json, "null" | "[]" | "\"\"") || json.contains("\"chapters\":[]")
+}
 
 struct Job {
     method: String,
@@ -59,6 +105,7 @@ fn debug() -> bool {
 
 fn run(code: String, storage: PathBuf, rx: mpsc::Receiver<Job>) {
     let deadline = Arc::new(AtomicU64::new(0));
+    let challenge: Arc<Mutex<Option<String>>> = Arc::default();
     let setup = || -> Result<(Runtime, Context, String), String> {
         let rt = Runtime::new().map_err(|e| e.to_string())?;
         rt.set_memory_limit(768 << 20);
@@ -71,7 +118,7 @@ fn run(code: String, storage: PathBuf, rx: mpsc::Receiver<Job>) {
         let ctx = Context::full(&rt).map_err(|e| e.to_string())?;
         let meta = ctx
             .with(|ctx| -> Result<String, String> {
-                natives(&ctx, storage).map_err(|e| e.to_string())?;
+                natives(&ctx, storage, challenge.clone()).map_err(|e| e.to_string())?;
                 ctx.eval::<(), _>(RUNTIME).catch(&ctx).map_err(|e| e.to_string())?;
                 let load: Function = ctx.globals().get("__load").map_err(|e| e.to_string())?;
                 load.call::<_, String>((code,)).catch(&ctx).map_err(|e| e.to_string())
@@ -93,8 +140,16 @@ fn run(code: String, storage: PathBuf, rx: mpsc::Receiver<Job>) {
             continue;
         }
         deadline.store(now_ms() + LIMIT.as_millis() as u64, Ordering::Relaxed);
-        let result = ctx.with(|ctx| call(&ctx, &job.method, &job.args, &deadline));
+        challenge.lock().unwrap().take();
+        let mut result = ctx.with(|ctx| call(&ctx, &job.method, &job.args, &deadline));
         deadline.store(0, Ordering::Relaxed);
+        let nothing = match &result {
+            Err(_) => true,
+            Ok(text) => looks_empty(text),
+        };
+        if nothing && let Some(url) = challenge.lock().unwrap().take() {
+            result = Err(format!("{CLOUDFLARE}{url}"));
+        }
         let _ = job.reply.send(result);
     }
 }
@@ -133,7 +188,7 @@ fn call(ctx: &Ctx, method: &str, args: &str, deadline: &AtomicU64) -> Result<Str
     }
 }
 
-fn natives(ctx: &Ctx, storage: PathBuf) -> rquickjs::Result<()> {
+fn natives(ctx: &Ctx, storage: PathBuf, challenge: Arc<Mutex<Option<String>>>) -> rquickjs::Result<()> {
     let globals = ctx.globals();
     globals.set(
         "__log",
@@ -144,7 +199,7 @@ fn natives(ctx: &Ctx, storage: PathBuf) -> rquickjs::Result<()> {
         })?,
     )?;
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(40))).build().into();
-    globals.set("__fetch", Function::new(ctx.clone(), move |req: String| fetch(&agent, &req))?)?;
+    globals.set("__fetch", Function::new(ctx.clone(), move |req: String| fetch(&agent, &req, &challenge))?)?;
     let kept: Arc<Mutex<BTreeMap<String, String>>> =
         Arc::new(Mutex::new(std::fs::read(&storage).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()));
     globals.set(
@@ -173,16 +228,28 @@ fn natives(ctx: &Ctx, storage: PathBuf) -> rquickjs::Result<()> {
 }
 
 /// One HTTP request for the plugin's `fetch`. Errors come back as `{"error": ...}` so JS can throw them.
-fn fetch(agent: &ureq::Agent, req: &str) -> String {
+fn fetch(agent: &ureq::Agent, req: &str, challenge: &Mutex<Option<String>>) -> String {
     let result = || -> Result<Value, String> {
         let req: Value = serde_json::from_str(req).map_err(|e| e.to_string())?;
         let url = req["url"].as_str().ok_or("fetch needs a url")?;
         let method = req["method"].as_str().unwrap_or("GET");
+        let mut headers: BTreeMap<String, String> = req["headers"].as_object().into_iter().flatten().map(|(k, v)| (k.to_ascii_lowercase(), v.as_str().unwrap_or_default().to_string())).collect();
+        if let Some(c) = JAR.lock().unwrap().get(&site_key(url)) {
+            if !c.user_agent.is_empty() {
+                headers.insert("user-agent".into(), c.user_agent.clone());
+            }
+            let mine = c.cookies.join("; ");
+            let cookie = match headers.remove("cookie") {
+                Some(own) if !own.is_empty() => format!("{own}; {mine}"),
+                _ => mine,
+            };
+            headers.insert("cookie".into(), cookie);
+        }
         let mut builder = ureq::http::Request::builder().method(method).uri(url);
-        for (k, v) in req["headers"].as_object().into_iter().flatten() {
+        for (k, v) in &headers {
             // ureq handles compression and length itself.
             if !matches!(k.as_str(), "accept-encoding" | "content-length" | "host") {
-                builder = builder.header(k.as_str(), v.as_str().unwrap_or_default());
+                builder = builder.header(k.as_str(), v.as_str());
             }
         }
         let body = req["body"].as_str().unwrap_or_default().as_bytes().to_vec();
@@ -197,6 +264,9 @@ fn fetch(agent: &ureq::Agent, req: &str) -> String {
         let bytes = res.body_mut().with_config().limit(32 << 20).read_to_vec().map_err(|e| format!("{url}: {e}"))?;
         if debug() {
             eprintln!("ln fetch {status} {} bytes", bytes.len());
+        }
+        if is_challenge(status.as_u16(), &headers, &bytes) {
+            *challenge.lock().unwrap() = Some(url.to_string());
         }
         Ok(serde_json::json!({
             "status": status.as_u16(),
@@ -237,6 +307,50 @@ mod tests {
         let js = Js::spawn(FAKE.into(), std::env::temp_dir().join("nano-ln-test-storage.json"));
         assert_eq!(futures::executor::block_on(js.meta()).unwrap()["id"], "fake");
         js
+    }
+
+    #[test]
+    fn a_cloudflare_check_is_reported_then_passes_with_its_cookie() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut s = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                let reply = if req.contains("cf_clearance=abc") && req.contains("user-agent: testbrowser") {
+                    "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+                } else {
+                    "HTTP/1.1 403 Forbidden\r\nserver: cloudflare\r\ncf-mitigated: challenge\r\ncontent-length: 5\r\nconnection: close\r\n\r\nnope!"
+                };
+                let _ = s.write_all(reply.as_bytes());
+            }
+        });
+        let code = format!(
+            "class P {{ id='cf'; name='CF'; async popularNovels() {{ const r = await fetch('http://127.0.0.1:{port}/x'); const t = await r.text(); return r.ok ? [{{ name: t, path: '/p' }}] : []; }} }}; exports.default = new P();"
+        );
+        let js = Js::spawn(code, std::env::temp_dir().join("nano-ln-test-cf.json"));
+        let err = futures::executor::block_on(js.call("popularNovels", serde_json::json!([1, {}]))).unwrap_err();
+        let url = challenge_url(&err).expect("a Cloudflare error");
+        assert!(url.contains(&port.to_string()));
+        keep_clearance(url, vec!["cf_clearance=abc; Path=/; HttpOnly".into()], "TestBrowser");
+        let list = futures::executor::block_on(js.call("popularNovels", serde_json::json!([1, {}]))).unwrap();
+        assert_eq!(list[0]["name"], "ok");
+    }
+
+    #[test]
+    fn challenge_and_site_detection() {
+        assert_eq!(site_key("https://www.royalroad.com/fiction/1"), "royalroad.com");
+        assert_eq!(site_key("http://user@api.example.org:8080/x?y"), "example.org");
+        let h = |k: &str, v: &str| vec![(k.to_string(), v.to_string())];
+        assert!(is_challenge(403, &h("cf-mitigated", "challenge"), b""));
+        assert!(is_challenge(503, &h("server", "cloudflare"), b"<title>Just a moment...</title>"));
+        assert!(!is_challenge(403, &h("server", "cloudflare"), b"Forbidden by site rules"));
+        assert!(!is_challenge(200, &h("cf-mitigated", "challenge"), b""));
+        assert!(looks_empty("[]") && looks_empty("null") && looks_empty(r#"{"name":"x","chapters":[]}"#));
+        assert!(!looks_empty(r#"[{"name":"a"}]"#));
     }
 
     #[test]

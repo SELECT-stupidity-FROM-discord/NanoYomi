@@ -96,11 +96,46 @@ pub async fn load_cover(source: &Source, cx: &mut gpui::AsyncApp, url: &str) -> 
 pub enum Fetch {
     Cover(Source),
     Icon,
+    /// A plain web address, sent with the site as its referrer. Light novel covers come this way.
+    Web(String),
+}
+
+/// Same disk cache as manga covers, but fetched straight from the site.
+async fn load_web_cover(cx: &mut gpui::AsyncApp, url: &str, referer: String) -> Result<Picture, String> {
+    let size = || images::fill((CARD_W * 2.) as u32, (CARD_H * 2.) as u32);
+    let cached = cache_path(url);
+    if let Some(p) = cached.clone().filter(|p| fresh(p)) {
+        let read = cx.background_executor().spawn(async move { images::decode_bytes(std::fs::read(&p).map_err(|e| e.to_string())?, size()).await }).await;
+        if let Ok(picture) = read {
+            return Ok(picture);
+        }
+    }
+    let url = url.to_string();
+    cx.background_executor()
+        .spawn(async move {
+            let mut req = ureq::get(&url).header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
+            if !referer.is_empty() {
+                req = req.header("Referer", &referer);
+            }
+            let bytes = req.call().map_err(|e| format!("{url}: {e}"))?.body_mut().with_config().limit(8 << 20).read_to_vec().map_err(|e| e.to_string())?;
+            match images::decode_bytes(bytes.clone(), size()).await {
+                Ok(picture) => {
+                    if let Some(target) = &cached {
+                        let _ = std::fs::create_dir_all(target.parent().unwrap());
+                        let _ = std::fs::write(target, &bytes);
+                    }
+                    Ok(picture)
+                }
+                Err(e) => Err(e),
+            }
+        })
+        .await
 }
 
 async fn fetch(how: Fetch, cx: &mut gpui::AsyncApp, url: &str) -> Result<Picture, String> {
     match how {
         Fetch::Cover(source) => load_cover(&source, cx, url).await,
+        Fetch::Web(referer) => load_web_cover(cx, url, referer).await,
         Fetch::Icon => {
             let url = url.to_string();
             cx.background_executor()

@@ -358,6 +358,11 @@ struct Root {
     /// Bumped each time the panel opens or closes, or the sidebar folds, so their slides start over.
     panel_moves: usize,
     sidebar_moves: usize,
+    /// Light novel mode, built the first time it's needed.
+    ln: Option<(Entity<ln::LnApp>, Subscription)>,
+    data_dir: PathBuf,
+    mode_anim: Option<sidebar::ModeAnim>,
+    _mode_task: gpui::Task<()>,
     /// Extension icons shown in the sidebar.
     icons: covers::Covers,
     focus: gpui::FocusHandle,
@@ -422,7 +427,22 @@ impl Root {
             let (store, registry, cache) = (store.clone(), registry.clone(), cache.clone());
             cx.new(|cx| History::new(store, registry, cache, cx))
         });
-        Root { cache, store, registry, tab, library, browse, global, catalog, history, saved: None, settings, manga: None, migrate: None, reader: None, palette: None, check: None, check_sub: None, banner, closing: None, panel_moves: 0, sidebar_moves: 0, icons: Default::default(), focus, _subs: subs }
+        let mut root = Root { cache, store, registry, tab, library, browse, global, catalog, history, saved: None, settings, manga: None, migrate: None, reader: None, palette: None, check: None, check_sub: None, banner, closing: None, panel_moves: 0, sidebar_moves: 0, ln: None, data_dir, mode_anim: None, _mode_task: gpui::Task::ready(()), icons: Default::default(), focus, _subs: subs };
+        if root.store.read(cx).prefs().ln {
+            root.make_ln(window, cx);
+        }
+        root
+    }
+
+    /// Light novel mode keeps its own data in an `ln` folder, apart from manga.
+    fn make_ln(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ln.is_some() {
+            return;
+        }
+        let (dir, main, cache) = (self.data_dir.clone(), self.store.clone(), self.cache.clone());
+        let app = cx.new(|cx| ln::LnApp::new(dir, main, cache, window, cx));
+        let sub = cx.subscribe_in(&app, window, |this, _, _: &ln::SwitchMode, window, cx| this.switch_mode(window, cx));
+        self.ln = Some((app, sub));
     }
 
     /// Remembers which sources the repos flag as 18+, or as mixing 18+ in, so they can be hidden.
@@ -617,6 +637,19 @@ impl Root {
         if let Some((reader, _)) = &self.reader {
             return root.child(reader.clone()).children(self.check.clone());
         }
+        if self.store.read(cx).prefs().ln
+            && let Some((ln, _)) = &self.ln
+        {
+            return root
+                .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+                .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom_by(0.1, cx)))
+                .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom_by(-0.1, cx)))
+                .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom_by(1. - zoom(), cx)))
+                .child(ln.clone())
+                .children(self.check.clone())
+                .child(self.banner.clone())
+                .children(self.mode_overlay(window));
+        }
         let screen: AnyElement = match self.tab {
             _ if self.migrate.is_some() => self.migrate.as_ref().unwrap().0.clone().into_any_element(),
             Tab::Library | Tab::Updates => self.library.clone().into_any_element(),
@@ -674,6 +707,7 @@ impl Root {
             .children(self.palette(cx))
             .children(self.check.clone())
             .children(self.check.as_ref().is_none_or(|c| !c.read(cx).is_open()).then(|| self.banner.clone()))
+            .children(self.mode_overlay(window))
     }
 }
 

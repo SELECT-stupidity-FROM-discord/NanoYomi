@@ -255,6 +255,9 @@ pub struct Prefs {
     pub right_to_left: bool,
     #[serde(default)]
     pub sidebar_collapsed: bool,
+    /// Light novel mode, which has its own library, history and extensions.
+    #[serde(default)]
+    pub ln: bool,
     #[serde(default)]
     pub auto_download: bool,
     #[serde(default)]

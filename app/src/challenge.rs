@@ -54,19 +54,47 @@ fn main_window(cx: &App) -> Option<WindowHandle<crate::Root>> {
     cx.windows().into_iter().find_map(|w| w.downcast::<crate::Root>())
 }
 
-/// Resolves true once the clearance cookie reaches the host. Errors if the user closes the panel.
-pub fn solve(cx: &mut App, host: Arc<Host>, url: String, user_agent: String) -> oneshot::Receiver<bool> {
+/// Where a passed check's cookies go: the extension host for manga, or the plugins' own requests in light novel mode.
+pub enum Sink {
+    Host(Arc<Host>),
+    Ln,
+}
+
+impl From<Arc<Host>> for Sink {
+    fn from(host: Arc<Host>) -> Self {
+        Sink::Host(host)
+    }
+}
+
+impl Sink {
+    async fn accept(&self, url: &str, cookies: Vec<String>, user_agent: &str) -> bool {
+        match self {
+            Sink::Host(host) => {
+                let set = host.set_cookies(url, cookies).await.is_ok();
+                // The webview passed with this agent, so the host keeps using it for the site.
+                if user_agent.is_empty() { set } else { set && host.call("setUserAgent", serde_json::json!({ "url": url, "userAgent": user_agent })).await.is_ok() }
+            }
+            Sink::Ln => {
+                crate::ln::js::keep_clearance(url, cookies, user_agent);
+                true
+            }
+        }
+    }
+}
+
+/// Resolves true once the clearance cookie reaches the sink. Errors if the user closes the panel.
+pub fn solve(cx: &mut App, sink: impl Into<Sink>, url: String, user_agent: String) -> oneshot::Receiver<bool> {
     let (tx, rx) = oneshot::channel();
-    open(cx, host, url, user_agent, "Verify to continue", Mode::Check(tx));
+    open(cx, sink.into(), url, user_agent, "Verify to continue", Mode::Check(tx));
     rx
 }
 
-/// Opens the site to sign in. Its cookies go to the host when the panel closes.
-pub fn browse(cx: &mut App, host: Arc<Host>, url: String, user_agent: String) {
-    open(cx, host, url, user_agent, "Sign in, then close this", Mode::SignIn);
+/// Opens the site to sign in. Its cookies go to the sink when the panel closes.
+pub fn browse(cx: &mut App, sink: impl Into<Sink>, url: String, user_agent: String) {
+    open(cx, sink.into(), url, user_agent, "Sign in, then close this", Mode::SignIn);
 }
 
-fn open(cx: &mut App, host: Arc<Host>, url: String, user_agent: String, title: &'static str, mode: Mode) {
+fn open(cx: &mut App, host: Sink, url: String, user_agent: String, title: &'static str, mode: Mode) {
     let Some(main) = main_window(cx) else { return };
     let _ = main.update(cx, |root, window, cx| {
         let mut builder = crate::webviews::builder().with_url(&url).with_bounds(rect(crate::titlebar::viewport(window)));
@@ -95,7 +123,7 @@ impl Check {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn new(webview: wry::WebView, host: Arc<Host>, url: String, user_agent: String, title: &'static str, mode: Mode, root: WeakEntity<crate::Root>, store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(webview: wry::WebView, host: Sink, url: String, user_agent: String, title: &'static str, mode: Mode, root: WeakEntity<crate::Root>, store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Kept drawn off to the side so the page runs at full speed.
         crate::webviews::native::keep_running_hidden(&webview);
         let sign_in = matches!(mode, Mode::SignIn);
@@ -197,9 +225,7 @@ impl Check {
                 }
                 // The full Set-Cookie form, which the host parses.
                 let header_values = cookies.iter().map(|c| c.to_string()).collect();
-                let ok = host.set_cookies(&url, header_values).await.is_ok()
-                    // The webview passed with this agent, so the host keeps using it for the site.
-                    && host.call("setUserAgent", serde_json::json!({ "url": url, "userAgent": passed_agent })).await.is_ok();
+                let ok = host.accept(&url, header_values, &passed_agent).await;
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(ok);
                 }
@@ -208,11 +234,8 @@ impl Check {
             }
             // Closing the panel ends a sign-in, so hand over its cookies.
             let header_values = last.iter().map(|c| c.to_string()).collect();
-            let _ = host.set_cookies(&url, header_values).await;
             let signed_in_agent = agent.lock().unwrap().clone();
-            if !signed_in_agent.is_empty() {
-                let _ = host.call("setUserAgent", serde_json::json!({ "url": url, "userAgent": signed_in_agent })).await;
-            }
+            host.accept(&url, header_values, &signed_in_agent).await;
         })
         .detach();
 
