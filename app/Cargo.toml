@@ -27,6 +27,7 @@ semver = "1"
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 avif-decode = { version = "3.0.0", default-features = false }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
 
 # The WebView2 calls wry doesn't wrap. Same versions wry uses.
 [target.'cfg(windows)'.dependencies]

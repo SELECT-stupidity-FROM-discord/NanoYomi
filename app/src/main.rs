@@ -1,6 +1,7 @@
 mod browse;
 mod catalog;
 mod challenge;
+mod cache_db;
 mod covers;
 mod downloads;
 mod ext_settings;
@@ -803,6 +804,7 @@ fn main() {
     let data_dir = data_dir();
     std::fs::create_dir_all(&data_dir).expect("create data dir");
     covers::set_cache_dir(data_dir.join("covers"));
+    cache_db::open(&data_dir.join("cache.db"));
     page_cache::set_dir(data_dir.join("pages"));
     downloads::set_dir(data_dir.join("downloads"));
     // Kagane serves JPEG XL, which `image` only decodes through this hook.

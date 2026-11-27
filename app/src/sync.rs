@@ -22,21 +22,21 @@ pub struct Config {
 /// Nano's view of a series as last synced.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Meta {
-    sent: Snapshot,
+    pub(crate) sent: Snapshot,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
-struct Snapshot {
-    in_library: bool,
-    progress: Option<(String, usize, i64)>,
+pub(crate) struct Snapshot {
+    pub(crate) in_library: bool,
+    pub(crate) progress: Option<(String, usize, i64)>,
     #[serde(default)]
-    marks: std::collections::BTreeMap<String, bool>,
+    pub(crate) marks: std::collections::BTreeMap<String, bool>,
     #[serde(default)]
-    bookmarks: std::collections::BTreeSet<String>,
+    pub(crate) bookmarks: std::collections::BTreeSet<String>,
     #[serde(default)]
-    categories: Vec<i64>,
+    pub(crate) categories: Vec<i64>,
     #[serde(default)]
-    tracks: Vec<Track>,
+    pub(crate) tracks: Vec<Track>,
 }
 
 impl Snapshot {

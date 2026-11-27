@@ -3,9 +3,11 @@
 use gpui::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+mod db;
 
 mod arc_vec {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -432,6 +434,7 @@ impl Nsfw {
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct Data {
+    #[serde(default)]
     series: Vec<Series>,
     #[serde(default)]
     languages: std::collections::HashMap<String, Vec<String>>,
@@ -472,6 +475,7 @@ pub enum SyncStatus {
 
 pub struct Store {
     path: PathBuf,
+    db: Arc<Mutex<db::Db>>,
     history_undo_gen: u64,
     data: Data,
     saving: bool,
@@ -491,21 +495,114 @@ pub fn now_ms() -> i64 {
 }
 
 impl Store {
+    /// Builds the database from a JSON copy of the library, and sets that file aside when it was the live one.
+    fn rebuild_from(src: &Path, db_path: &Path, db: &mut db::Db, set_aside: bool) -> Option<Data> {
+        let mut data = std::fs::read(src).ok().and_then(|b| {
+            serde_json::from_slice::<Data>(&b)
+                .map_err(|e| eprintln!("{}: {e}", src.display()))
+                .ok()
+        })?;
+        for s in &mut data.series {
+            s.migrate_read_marks();
+        }
+        // Built beside the real file and moved in once complete, so a crash can't leave half a library.
+        let staging = db_path.with_extension("db.new");
+        let _ = std::fs::remove_file(&staging);
+        let built = {
+            let mut tmp = db::Db::new(staging.clone());
+            tmp.save(data.clone())
+        };
+        if let Err(e) = built {
+            eprintln!("{}: {e}", staging.display());
+            return Some(data);
+        }
+        if std::fs::rename(&staging, db_path).is_err() {
+            return Some(data);
+        }
+        match db.load() {
+            Ok(Some(stored)) => {
+                if set_aside {
+                    let _ = std::fs::rename(src, src.with_extension("json.pre-sqlite"));
+                }
+                Some(stored)
+            }
+            _ => Some(data),
+        }
+    }
+
+    /// Puts the last good database back, copying it over the missing one.
+    fn restore_backup(db_path: &Path, db: &mut db::Db) -> Option<Data> {
+        let backup = db_path.with_extension("db.bak");
+        std::fs::copy(&backup, db_path).ok()?;
+        *db = db::Db::new(db_path.to_path_buf());
+        match db.load() {
+            Ok(Some(data)) => {
+                eprintln!("{} restored from {}", db_path.display(), backup.display());
+                Some(data)
+            }
+            _ => {
+                *db = db::Db::new(db_path.to_path_buf());
+                let _ = std::fs::remove_file(db_path);
+                None
+            }
+        }
+    }
+
+    /// With no usable database, takes the library from the first copy that reads: library.json, the last backup, the copy kept at the upgrade.
+    fn recover(path: &Path, db_path: &Path, db: &mut db::Db) -> Data {
+        Self::rebuild_from(path, db_path, db, true)
+            .or_else(|| Self::restore_backup(db_path, db))
+            .or_else(|| Self::rebuild_from(&path.with_extension("json.pre-sqlite"), db_path, db, false))
+            .unwrap_or_default()
+    }
+
+    /// Keeps an unreadable database, and its write-ahead log so that is not applied to the next one.
+    fn set_aside(db_path: &Path) {
+        for (from, to) in [("db", "db.broken"), ("db-wal", "db.broken-wal"), ("db-shm", "db.broken-shm")] {
+            let to = db_path.with_extension(to);
+            let _ = std::fs::remove_file(&to);
+            let _ = std::fs::rename(db_path.with_extension(from), to);
+        }
+    }
+
+    /// A fresh copy of the database once per launch, so a bad one costs the last session and not the library.
+    fn keep_a_backup(db_path: &Path) {
+        let (from, to) = (db_path.to_path_buf(), db_path.with_extension("db.bak"));
+        let run = move || {
+            if let Err(e) = db::backup(&from, &to) {
+                eprintln!("backup {}: {e}", to.display());
+            }
+        };
+        if cfg!(test) {
+            run();
+        } else {
+            std::thread::spawn(run);
+        }
+    }
+
     pub fn load(path: PathBuf) -> Self {
-        let mut data: Data = std::fs::read(&path)
-            .ok()
-            .and_then(|b| {
-                serde_json::from_slice(&b)
-                    .map_err(|e| eprintln!("{}: {e}", path.display()))
-                    .ok()
-            })
-            .unwrap_or_default();
+        let db_path = path.with_extension("db");
+        let mut db = db::Db::new(db_path.clone());
+        let mut data: Data = match db.load() {
+            Ok(Some(data)) => data,
+            Ok(None) => Self::recover(&path, &db_path, &mut db),
+            Err(e) => {
+                eprintln!("{}: {e}", db_path.display());
+                db = db::Db::new(db_path.clone());
+                Self::set_aside(&db_path);
+                Self::recover(&path, &db_path, &mut db)
+            }
+        };
+        if db_path.exists() {
+            Self::keep_a_backup(&db_path);
+        }
         for s in &mut data.series {
             s.migrate_read_marks();
         }
         Store {
             history_undo_gen: 0,
             path,
+            db: Arc::new(Mutex::new(db)),
             data,
             saving: false,
             dirty: false,
@@ -977,22 +1074,21 @@ impl Store {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
-                let Ok(Some((path, snapshot))) = this.update(cx, |s, _| {
+                let Ok(Some((db, snapshot))) = this.update(cx, |s, _| {
                     if !s.dirty {
                         s.saving = false;
                         return None;
                     }
                     s.dirty = false;
-                    Some((s.path.clone(), s.data.clone()))
+                    Some((s.db.clone(), s.data.clone()))
                 }) else {
                     return;
                 };
                 cx.background_executor()
                     .spawn(async move {
-                        let bytes = serde_json::to_vec(&snapshot).unwrap_or_default();
-                        let tmp = path.with_extension("tmp");
-                        if let Err(e) = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, &path)) {
-                            eprintln!("save {}: {e}", path.display());
+                        let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Err(e) = db.save(snapshot) {
+                            eprintln!("save: {e}");
                         }
                     })
                     .await;
@@ -1427,4 +1523,148 @@ fn prefs_read_from_old_files() {
             .unwrap()
             .contains(r#""vertical_reader":true"#)
     );
+}
+
+#[cfg(test)]
+#[test]
+fn the_old_json_library_moves_into_sqlite_once() {
+    let dir = std::env::temp_dir().join(format!("nano-move-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let json = dir.join("library.json");
+    let mut s = Series::new("1".into(), "S".into(), serde_json::json!({ "url": "/m", "title": "T" }));
+    s.in_library = true;
+    s.chapters = Arc::new(vec![serde_json::json!({ "url": "/c1" })]);
+    let data = Data { series: vec![s], ..Default::default() };
+    std::fs::write(&json, serde_json::to_vec(&data).unwrap()).unwrap();
+
+    let store = Store::load(json.clone());
+    assert_eq!(store.all_series().len(), 1);
+    assert!(dir.join("library.db").exists());
+    assert!(!json.exists() && dir.join("library.json.pre-sqlite").exists());
+
+    let again = Store::load(json);
+    assert_eq!(again.all_series()[0].chapters.len(), 1);
+    assert!(again.all_series()[0].in_library);
+}
+
+#[cfg(test)]
+#[test]
+#[ignore]
+fn sqlite_matches_json_on_a_real_library() {
+    use std::time::Instant;
+    let src: PathBuf = std::env::var_os("NANO_BENCH_FILE").expect("set NANO_BENCH_FILE").into();
+    let dir = std::env::temp_dir().join(format!("nano-real-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let json = dir.join("library.json");
+    std::fs::copy(&src, &json).unwrap();
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
+
+    let t = Instant::now();
+    let mut expected: Data = serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
+    for s in &mut expected.series {
+        s.migrate_read_marks();
+    }
+    println!("BENCH json_load_ms {:.1}", ms(t));
+    let want = serde_json::to_value(&expected.series).unwrap();
+
+    let t = Instant::now();
+    let first = Store::load(json.clone());
+    println!("BENCH migrate_ms {:.1}", ms(t));
+    assert_eq!(serde_json::to_value(first.all_series()).unwrap(), want, "migrated library differs");
+    drop(first);
+
+    let t = Instant::now();
+    let second = Store::load(json.clone());
+    println!("BENCH sqlite_load_ms {:.1}", ms(t));
+    assert_eq!(serde_json::to_value(second.all_series()).unwrap(), want, "reloaded library differs");
+    drop(second);
+
+    let json_bytes = std::fs::metadata(dir.join("library.json.pre-sqlite")).unwrap().len();
+    let db_bytes = std::fs::metadata(dir.join("library.db")).unwrap().len();
+    println!("BENCH json_bytes {json_bytes} db_bytes {db_bytes}");
+
+    // Reading on in one series, saved the old way and the new way.
+    let mut db = db::Db::new(dir.join("library.db"));
+    let mut data = db.load().unwrap().unwrap();
+    let p = data.series.iter().position(|s| s.progress.is_some()).unwrap_or(0);
+    data.series[p].progress = Some(Progress { chapter_url: "/x".into(), chapter_name: "x".into(), page: 7, pages: 9, at: 1 });
+    let t = Instant::now();
+    let rows = db.save(data.clone()).unwrap();
+    println!("BENCH sqlite_one_change_save_ms {:.2} rows {rows}", ms(t));
+    let t = Instant::now();
+    let rows = db.save(data.clone()).unwrap();
+    println!("BENCH sqlite_no_change_save_ms {:.2} rows {rows}", ms(t));
+    let t = Instant::now();
+    std::fs::write(dir.join("old.json"), serde_json::to_vec(&data).unwrap()).unwrap();
+    println!("BENCH json_save_ms {:.2}", ms(t));
+}
+
+#[cfg(test)]
+fn migrated(name: &str) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("nano-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let json = dir.join("library.json");
+    let mut s = Series::new("1".into(), "S".into(), serde_json::json!({ "url": "/m", "title": "T" }));
+    s.in_library = true;
+    s.chapters = Arc::new(vec![serde_json::json!({ "url": "/c1" })]);
+    std::fs::write(&json, serde_json::to_vec(&Data { series: vec![s], ..Default::default() }).unwrap()).unwrap();
+    drop(Store::load(json.clone()));
+    (dir, json)
+}
+
+#[cfg(test)]
+fn wreck(dir: &Path) {
+    std::fs::write(dir.join("library.db"), vec![0xAB; 4096]).unwrap();
+    let _ = std::fs::remove_file(dir.join("library.db-wal"));
+    let _ = std::fs::remove_file(dir.join("library.db-shm"));
+}
+
+#[cfg(test)]
+#[test]
+fn a_broken_database_comes_back_from_the_last_backup() {
+    let (dir, json) = migrated("from-backup");
+    assert!(dir.join("library.db.bak").exists(), "the first launch keeps a backup");
+    // Something done after the upgrade, then another backup, then the database breaks.
+    let mut db = db::Db::new(dir.join("library.db"));
+    let mut data = db.load().unwrap().unwrap();
+    data.series[0].added_at = 42;
+    db.save(data).unwrap();
+    drop(db);
+    db::backup(&dir.join("library.db"), &dir.join("library.db.bak")).unwrap();
+    wreck(&dir);
+
+    let store = Store::load(json);
+    assert_eq!(store.all_series().len(), 1);
+    assert_eq!(store.all_series()[0].added_at, 42, "newer than the copy kept at the upgrade");
+    assert!(dir.join("library.db.broken").exists());
+}
+
+#[cfg(test)]
+#[test]
+fn without_a_backup_it_falls_back_to_the_copy_kept_at_the_upgrade() {
+    let (dir, json) = migrated("from-snapshot");
+    std::fs::remove_file(dir.join("library.db.bak")).unwrap();
+    wreck(&dir);
+
+    let store = Store::load(json.clone());
+    assert_eq!(store.all_series().len(), 1);
+    assert!(store.all_series()[0].in_library);
+    assert!(dir.join("library.db.broken").exists());
+    assert!(dir.join("library.json.pre-sqlite").exists(), "the snapshot stays for next time");
+    assert!(!json.exists());
+    drop(store);
+    assert_eq!(Store::load(json).all_series().len(), 1, "the rebuilt database loads");
+}
+
+#[cfg(test)]
+#[test]
+fn with_nothing_left_it_starts_empty_instead_of_failing() {
+    let (dir, json) = migrated("nothing-left");
+    std::fs::remove_file(dir.join("library.db.bak")).unwrap();
+    std::fs::remove_file(dir.join("library.json.pre-sqlite")).unwrap();
+    wreck(&dir);
+    assert!(Store::load(json).all_series().is_empty());
 }
