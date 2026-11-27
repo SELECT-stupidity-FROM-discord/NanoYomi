@@ -1,5 +1,4 @@
-//! Some sites let a real browser through a check but turn away plain HTTP whatever cookies it carries.
-//! Their requests are made from inside a hidden web view instead.
+//! Requests made from a hidden web view, for sites that turn away plain HTTP even with the cookies.
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use gpui::Window;
@@ -20,6 +19,8 @@ pub struct Job {
     pub id: u64,
     pub origin: String,
     pub script: String,
+    /// Load this page in the view instead of running the script.
+    pub navigate: Option<String>,
 }
 
 /// The scheme and host of an address, like `https://example.com`.
@@ -79,23 +80,93 @@ pub fn fetch(req: &Value) -> Reply {
     );
     let (tx, rx) = mpsc::channel();
     PENDING.lock().unwrap().insert(id, tx);
-    let sent = QUEUE.get().ok_or("The browser isn't ready")?.unbounded_send(Job { id, origin: origin_of(url), script });
-    if sent.is_err() {
-        PENDING.lock().unwrap().remove(&id);
-        return Err("The browser isn't ready".into());
-    }
-    rx.recv_timeout(Duration::from_secs(75)).unwrap_or_else(|_| {
+    send(Job { id, origin: origin_of(url), script, navigate: None })?;
+    let reply = rx.recv_timeout(Duration::from_secs(75)).unwrap_or_else(|_| {
         PENDING.lock().unwrap().remove(&id);
         Err("The page took too long to answer".into())
+    });
+    // Some pages turn away a script's request but let a page load through.
+    let get = req["method"].as_str().is_none_or(|m| m.eq_ignore_ascii_case("GET"));
+    match reply {
+        Ok(r) if get && challenged(&r) => {
+            if std::env::var_os("NANO_LN_DEBUG").is_some() {
+                eprintln!("ln fetch {url} was challenged in the page, loading it instead");
+            }
+            navigate(url)
+        }
+        other => other,
+    }
+}
+
+fn send(job: Job) -> Result<(), String> {
+    let id = job.id;
+    QUEUE.get().ok_or("The browser isn't ready")?.unbounded_send(job).map_err(|_| {
+        PENDING.lock().unwrap().remove(&id);
+        "The browser isn't ready".to_string()
     })
 }
 
-/// One hidden web view per site, kept on the site's own page so its requests count as the site's.
+fn challenged(r: &Value) -> bool {
+    let headers: Vec<(String, String)> = r["headers"].as_array().into_iter().flatten().filter_map(|h| Some((h[0].as_str()?.to_string(), h[1].as_str()?.to_string()))).collect();
+    super::js::is_challenge(r["status"].as_u64().unwrap_or(0) as u16, &headers, r["body"].as_str().unwrap_or("").as_bytes())
+}
+
+/// Asks the page where it is and what it shows. None if it didn't answer in time.
+fn look(origin: &str) -> Option<Value> {
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let script = format!(
+        "(() => (window.webkit ? window.webkit.messageHandlers.ipc : window.ipc).postMessage(JSON.stringify({{ id: {id}, title: document.title, ready: document.readyState, href: location.href, \
+         html: document.readyState === 'complete' ? document.documentElement.outerHTML : '' }})))()"
+    );
+    let (tx, rx) = mpsc::channel();
+    PENDING.lock().unwrap().insert(id, tx);
+    if send(Job { id, origin: origin.to_string(), script, navigate: None }).is_err() {
+        return None;
+    }
+    match rx.recv_timeout(Duration::from_secs(8)) {
+        Ok(Ok(m)) => Some(m),
+        _ => {
+            PENDING.lock().unwrap().remove(&id);
+            None
+        }
+    }
+}
+
+fn same_page(a: &str, b: &str) -> bool {
+    let trim = |s: &str| s.split('#').next().unwrap_or("").trim_end_matches('/').to_string();
+    trim(a) == trim(b)
+}
+
+/// Loads the page in the view and waits for any check on it to finish, then answers with what the page shows.
+fn navigate(url: &str) -> Reply {
+    let origin = origin_of(url);
+    let before = look(&origin).and_then(|m| m["href"].as_str().map(str::to_string)).unwrap_or_default();
+    send(Job { id: 0, origin: origin.clone(), script: String::new(), navigate: Some(url.to_string()) })?;
+    let started = std::time::Instant::now();
+    let mut last = Value::Null;
+    while started.elapsed() < Duration::from_secs(45) {
+        std::thread::sleep(Duration::from_millis(800));
+        let Some(m) = look(&origin) else { continue };
+        let title = m["title"].as_str().unwrap_or("").to_lowercase();
+        let href = m["href"].as_str().unwrap_or("").to_string();
+        let html = m["html"].as_str().unwrap_or("");
+        let checking = title.contains("just a moment") || title.contains("attention required");
+        // The old page can still be showing for a moment after the load starts.
+        let moved = !same_page(&href, &before) || same_page(&href, url) && started.elapsed() > Duration::from_millis(2500);
+        if m["ready"] == "complete" && !checking && !html.is_empty() && moved {
+            return Ok(json!({ "status": 200, "statusText": "OK", "url": href, "headers": [], "body": html }));
+        }
+        last = m;
+    }
+    Ok(json!({ "status": 403, "statusText": "Forbidden", "url": url, "headers": [["cf-mitigated", "challenge"]], "body": last["html"].as_str().unwrap_or("") }))
+}
+
+/// One hidden web view per site, kept on the site's own page.
 #[derive(Default)]
 pub struct Views(HashMap<String, (wry::WebView, Arc<AtomicBool>)>);
 
 impl Views {
-    /// The flag turns true once the page has loaded. None if the system web view won't start.
+    /// The flag turns true once the page has loaded.
     pub fn ensure(&mut self, origin: &str, window: &mut Window) -> Option<Arc<AtomicBool>> {
         if let Some((_, loaded)) = self.0.get(origin) {
             return Some(loaded.clone());
@@ -129,6 +200,12 @@ impl Views {
                 eprintln!("system webview unavailable: {e}");
                 None
             }
+        }
+    }
+
+    pub fn go(&self, origin: &str, url: &str) {
+        if let Some((view, _)) = self.0.get(origin) {
+            let _ = view.load_url(url);
         }
     }
 

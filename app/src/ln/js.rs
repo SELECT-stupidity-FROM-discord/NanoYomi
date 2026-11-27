@@ -48,7 +48,7 @@ pub fn keep_clearance(url: &str, set_cookies: Vec<String>, user_agent: &str) {
     JAR.lock().unwrap().insert(site_key(url), Clearance { cookies, user_agent: user_agent.to_string() });
 }
 
-fn is_challenge(status: u16, headers: &[(String, String)], body: &[u8]) -> bool {
+pub(super) fn is_challenge(status: u16, headers: &[(String, String)], body: &[u8]) -> bool {
     if !matches!(status, 403 | 429 | 503) {
         return false;
     }
@@ -76,7 +76,7 @@ pub struct Js {
 }
 
 impl Js {
-    /// Starts the plugin's thread. The plugin loads there, so this never waits, and a plugin that won't load fails its first call.
+    /// Starts the plugin's thread. The plugin loads there, so a plugin that won't load fails its first call.
     pub fn spawn(code: String, storage: PathBuf) -> Js {
         let (tx, rx) = mpsc::channel::<Job>();
         let spawned = std::thread::Builder::new().name("ln-plugin".into()).stack_size(16 << 20).spawn(move || run(code, storage, rx));
@@ -86,7 +86,6 @@ impl Js {
         Js { tx }
     }
 
-    /// What the plugin says about itself: its filters, settings and so on.
     pub async fn meta(&self) -> Result<Value, String> {
         self.call("__meta", Value::Null).await
     }

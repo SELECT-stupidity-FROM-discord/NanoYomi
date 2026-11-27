@@ -1,5 +1,5 @@
-//! Light novel mode: LNReader's JavaScript plugins, with a library, history and extensions of their own.
-//! Nothing here reads or writes manga data. Switching modes swaps the whole window content.
+//! Light novel mode: LNReader's JavaScript plugins with a library, history and extensions apart from manga.
+//! Nothing here reads or writes manga data.
 
 mod browse;
 mod browser;
@@ -31,20 +31,17 @@ use store::{LnStore, Novel};
 pub const PAD: f32 = 40.;
 pub const GAP: f32 = 24.;
 
-/// Open a novel's page.
 pub struct OpenNovel {
     pub source: String,
     pub path: String,
 }
 
-/// Open the reader on a chapter of a stored novel.
 pub struct ReadChapter {
     pub source: String,
     pub path: String,
     pub chapter: String,
 }
 
-/// Asks the window to go back to manga.
 pub struct SwitchMode;
 
 static CHAPTER_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -59,7 +56,7 @@ pub fn clear_chapter_cache() {
     }
 }
 
-/// Runs a plugin call. When a site answers with a Cloudflare check, solves it in a web view and tries once more.
+/// Runs a plugin call, and solves a Cloudflare check in a web view if the site shows one.
 pub(crate) async fn guarded<T, Fut: std::future::Future<Output = Result<T, String>>>(cx: &mut gpui::AsyncApp, mut call: impl FnMut() -> Fut) -> Result<T, String> {
     let first = call().await;
     let Some(url) = first.as_ref().err().and_then(|e| js::challenge_url(e)).map(str::to_string) else { return first };
@@ -85,7 +82,7 @@ pub(crate) fn cover_fetch(plugins: &Plugins, source: &str) -> Option<Fetch> {
     plugins.entry(source).map(|e| Fetch::Web(e.site.clone()))
 }
 
-/// A cover with its title and a line or two under it. The caller adds the click.
+/// A cover with its title and a few lines under it.
 pub(crate) fn card(id: impl Into<gpui::ElementId>, image: Option<std::sync::Arc<gpui::RenderImage>>, title: &str, w: f32, badge: usize, lines: Vec<String>) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -136,11 +133,9 @@ pub struct LnApp {
     novel: Option<(Entity<novel::NovelView>, Subscription)>,
     /// The panel that's sliding shut, kept until it's out of sight.
     closing: Option<Entity<novel::NovelView>>,
-    /// Bumped each time the panel opens or closes so its slide starts over.
     panel_moves: usize,
     reader: Option<(Entity<reader::LnReader>, Subscription)>,
     icons: Covers,
-    /// Bumped when the sidebar opens or closes, so its slide starts over.
     sidebar_moves: usize,
     was_narrow: Option<bool>,
     palette: Option<palette::LnPalette>,
@@ -183,7 +178,10 @@ impl LnApp {
                     browser::fail(job.id, "The site's page didn't load");
                     continue;
                 }
-                let _ = this.update(cx, |this, _| this.browsers.run(&job.origin, &job.script));
+                let _ = this.update(cx, |this, _| match &job.navigate {
+                    Some(url) => this.browsers.go(&job.origin, url),
+                    None => this.browsers.run(&job.origin, &job.script),
+                });
             }
         })
         .detach();
@@ -274,7 +272,7 @@ impl LnApp {
 
     fn sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let narrow = self.main.read(cx).prefs().sidebar_collapsed;
-        // ⌘\ flips the same preference from the window, so the slide starts from whichever side changed it.
+        // ⌘\ changes the pref from the window, so the slide starts here.
         if self.was_narrow.is_some_and(|w| w != narrow) {
             self.sidebar_moves += 1;
         }
@@ -486,7 +484,6 @@ impl Render for LnApp {
             Screen::Extensions => self.catalog.clone().map(IntoElement::into_any_element).unwrap_or_else(|| div().into_any_element()),
             Screen::Settings => self.settings.clone().map(IntoElement::into_any_element).unwrap_or_else(|| div().into_any_element()),
         };
-        // The novel slides open beside the grid, so you keep your place in it.
         let open = self.novel.is_some();
         let panel = self.novel.as_ref().map(|(v, _)| v.clone()).or_else(|| self.closing.clone()).map(|view| {
             let (from, to) = if open { (0., crate::manga::PANEL) } else { (crate::manga::PANEL, 0.) };
@@ -498,7 +495,7 @@ impl Render for LnApp {
                 .border_l_1()
                 .border_color(rgb(RULE))
                 .bg(rgb(0x11100E))
-                // A fixed width pinned to the right, so it slides in whole instead of rewrapping.
+                // Fixed width, so it slides in whole instead of rewrapping.
                 .child(div().absolute().top_0().bottom_0().right_0().w(u(crate::manga::PANEL)).child(view))
                 .with_animation(("ln-panel", self.panel_moves), Animation::new(crate::SLIDE).with_easing(gpui::ease_out_quint()), move |d, t| {
                     let w = from + (to - from) * t;
