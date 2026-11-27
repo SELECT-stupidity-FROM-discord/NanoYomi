@@ -7,7 +7,7 @@ use crate::images::ImageCache;
 use crate::registry::Registry;
 use crate::store::{Series, Store, ago, now_ms};
 use crate::segmented::Segmented;
-use gpui::{AnimationExt, ScrollEvent};
+use gpui::{AnimationExt, App, ClickEvent, Div, Task, px};
 use crate::{ACCENT, ACCENT_TEXT, FAINT, LINE, MUTED, RULE, SURFACE, Source, TEXT, heading, pill};
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FontWeight, InteractiveElement, IntoElement, ListAlignment, ListState,
@@ -16,6 +16,7 @@ use gpui::{
     ScrollHandle, point
 };
 use serde_json::{Value, json};
+use std::time::{Duration, Instant};
 use std::sync::Arc;
 
 const PAD: f32 = 40.;
@@ -125,6 +126,7 @@ pub struct Library {
     /// Indexes into `series` for Continue reading.
     shelf: Vec<usize>,
     shelf_scroll: ScrollHandle,
+    shelf_anim: Option<Task<()>>,
     shelf_shape: (bool, bool),
     undo_count: usize,
     /// Bumped whenever the store changes. Rebuilding the library clones every series and chapter, so that only
@@ -196,6 +198,7 @@ impl Library {
             shown: vec![],
             shelf: vec![],
             shelf_scroll: ScrollHandle::new(),
+            shelf_anim: None,
             shelf_shape: (false, false),
             undo_count: 0,
             data_gen: 0,
@@ -352,6 +355,101 @@ impl Library {
         div().font_family(crate::fonts::mono()).text_size(u(13.)).font_weight(FontWeight::MEDIUM).text_color(rgb(MUTED)).child(text)
     }
 
+    fn page_continue_read(&mut self, dir: i32, cx: &mut Context<Self>) {
+        const EPS: f32 = 1.0;
+        const ANIMATION_DURATION: u64 = 16;
+
+        // Jump calculation starts here
+        let handle = self.shelf_scroll.clone();
+        let from = handle.offset().x;
+        let max_x = handle.max_offset().x;
+        let viewport_left = handle.bounds().left();
+
+        let scrolled = -f32::from(from);
+
+        // Each card's left edge in content coordinates in ascending order (0 for the first card).
+        // These don't change as you scroll, so they compare directly with `scrolled`.
+        let lefts = (0..handle.children_count())
+            .filter_map(|ix| handle.bounds_for_item(ix))
+            .map(|b| f32::from(b.left() - viewport_left));
+
+        let target = if dir > 0 {
+            // Find the next card to the right
+            lefts.clone().find(|l| *l > scrolled + EPS)
+        } else {
+            // Find the next card to the left
+            lefts.filter(|l| *l < scrolled - EPS).max_by(f32::total_cmp)
+        };
+
+        let Some(target) = target else { return };
+        let to = px(-target).clamp(-max_x, px(0.));
+
+        // If distance to move is less than a pixel, skip animation
+        if f32::from(to - from).abs() < 0.5 {
+            return;
+        }
+
+        // Animation handling starts here
+        let y = handle.offset().y;
+        let start = Instant::now();
+        let duration = Duration::from_millis(280);
+
+        // Assigning a new task drops (cancels) any animation still running
+        self.shelf_anim = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let t = (start.elapsed().as_secs_f32() / duration.as_secs_f32()).min(1.);
+                let eased = 1. - (1. - t).powi(3);
+                let x = from + (to - from) * eased;
+
+                let alive = this
+                    .update(cx, |this, cx| {
+                        this.shelf_scroll.set_offset(point(x, y));
+                        cx.notify();
+                    })
+                    .is_ok();
+
+                if !alive || t >= 1. {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(ANIMATION_DURATION))
+                    .await;
+            }
+        }));
+    }
+
+    fn continue_read_arrows(
+        id: &'static str,
+        glyph: &'static str,
+        left: bool,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Div {
+        div()
+            .absolute()
+            .when(left, |d| d.left(u(7.)))
+            .when(!left, |d| d.right(u(7.)))
+            .top_0()
+            .bottom(u(6.))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .child(
+                div()
+                    .id(id)
+                    .size(u(28.))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .invisible()
+                    .group_hover("continue-reading", |s| s.visible())
+                    .hover(|s| s.bg(rgb(SURFACE)))
+                    .child(div().text_size(u(22.)).text_color(rgb(TEXT)).child(glyph))
+                    .on_click(on_click),
+            )
+    }
+
     fn shelf(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let avail = self.width / crate::zoom() - 2. * PAD;
         let n = ((avail + 14.) / 314.).floor().clamp(1., 3.) as usize;
@@ -477,7 +575,6 @@ impl Library {
             .collect();
 
         let undo_count = self.undo_count;
-        let step = u(w + 14.);
 
         div()
             .w_full()
@@ -492,135 +589,46 @@ impl Library {
                         div()
                             .w_full()
                             .relative()
+                            .flex()
+                            .flex_row()
                             .group("continue-reading")
-                            // Horizontal scroll reader for continue reading
                             .child(
+                                // Scrollable area of continue reading
                                 div()
                                     .id("continue-reading-scroll")
-                                    .w_full()
+                                    .flex_1()
                                     .min_w_0()
                                     .flex()
                                     .gap(u(14.))
-                                    .overflow_x_scroll()
-                                    .track_scroll(&self.shelf_scroll)
-                                    .on_scroll(cx.listener(
-                                        |_, event: &ScrollEvent, _, cx| {
-                                            if !event.modifiers.shift {
-                                                cx.stop_propagation();
-                                            }
-                                        },
-                                    ))
                                     .pb(u(6.))
-                                    .children(cards))
+                                    .overflow_x_scroll()
+                                    .overflow_y_hidden()
+                                    .track_scroll(&self.shelf_scroll)
+                                    .children(cards),
                             )
-                            .when(self.shelf.len() > n, |d| {
-                                d.child(
-                                    div()
-                                        .absolute()
-                                        .left_0()
-                                        .top_0()
-                                        .bottom_0()
-                                        .flex()
-                                        .items_center()
-                                        .child(
-                                            div()
-                                            .id("continue-reading-left")
-                                            .size(u(36.))
-                                            .rounded_full()
-                                            .border_1()
-                                            .border_color(rgb(LINE))
-                                            .bg(rgb(SURFACE))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .cursor_pointer()
-                                            .invisible()
-                                            .group_hover(
-                                                "continue-reading",
-                                                |d| d.visible(),
-                                            )
-                                            .hover(|s| {
-                                                s.bg(rgb(crate::HOVER))
-                                            })
-                                            .child(
-                                                div()
-                                                    .text_size(u(24.))
-                                                    .text_color(rgb(TEXT))
-                                                    .child("<"),
-                                            )
-                                            .on_click(cx.listener(
-                                                move |this, _, _, cx| {
-                                                    cx.stop_propagation();
-
-                                                    let offset = this.shelf_scroll.offset();
-
-                                                    this.shelf_scroll.set_offset(
-                                                        point(
-                                                            offset.x + step,
-                                                            offset.y,
-                                                        ),
-                                                    );
-
-                                                    cx.notify();
-                                                },
-                                            )),
-                                        ),
+                            .child(
+                                // Left arrow key
+                                Self::continue_read_arrows(
+                                    "continue-reading-prev", "‹", true,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.page_continue_read(-1, cx);
+                                            cx.notify();
+                                            cx.stop_propagation();
+                                    }),
                                 )
-                            })
-                            .when(self.shelf.len() > n, |d| {
-                                d.child(
-                                    div()
-                                        .absolute()
-                                        .right_0()
-                                        .top_0()
-                                        .bottom_0()
-                                        .flex()
-                                        .items_center()
-                                        .child(
-                                            div()
-                                            .id("continue-reading-right")
-                                            .size(u(36.))
-                                            .rounded_full()
-                                            .border_1()
-                                            .border_color(rgb(LINE))
-                                            .bg(rgb(SURFACE))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .cursor_pointer()
-                                            .invisible()
-                                            .group_hover(
-                                                "continue-reading",
-                                                |d| d.visible(),
-                                            )
-                                            .hover(|s| {
-                                                s.bg(rgb(crate::HOVER))
-                                            })
-                                            .child(
-                                                div()
-                                                    .text_size(u(24.))
-                                                    .text_color(rgb(TEXT))
-                                                    .child(">"),
-                                            )
-                                            .on_click(cx.listener(
-                                                move |this, _, _, cx| {
-                                                    cx.stop_propagation();
-
-                                                    let offset = this.shelf_scroll.offset();
-
-                                                    this.shelf_scroll.set_offset(
-                                                        point(
-                                                            offset.x - step,
-                                                            offset.y,
-                                                        ),
-                                                    );
-
-                                                    cx.notify();
-                                                },
-                                            )),
-                                        ),
+                            )
+                            .child(
+                                // Right arrow key
+                                Self::continue_read_arrows(
+                                    "continue-reading-next", "›", false,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.page_continue_read(1, cx);
+                                            cx.notify();
+                                            cx.stop_propagation();
+                                    }),
                                 )
-                            })
+                            )
+                        )
             })
             .when(undo_count > 0, |d| {
                 d.child(crate::history_undo_banner(
