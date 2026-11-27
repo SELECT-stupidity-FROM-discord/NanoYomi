@@ -159,9 +159,12 @@ pub const HEAP_CHOICES_MB: [u32; 4] = [64, 128, 256, 512];
 
 /// About 1/128 of the machine's memory, kept between 64 and 256 MB.
 pub fn auto_heap_mb() -> u32 {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    heap_for(sys.total_memory())
+    static CACHED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        heap_for(sys.total_memory())
+    })
 }
 
 fn heap_for(total_bytes: u64) -> u32 {

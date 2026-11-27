@@ -85,7 +85,7 @@ impl Saved {
             (_, Some(s)) => s.manga.clone(),
             _ => json!({ "title": title, "url": format!("local:{}/{}", found.source_dir, title) }),
         };
-        let known = found.saved["chapters"].as_array().cloned().unwrap_or_default().into_iter().chain(from_library.map(|s| s.chapters.clone()).unwrap_or_default());
+        let known = found.saved["chapters"].as_array().cloned().unwrap_or_default().into_iter().chain(from_library.map(|s| (*s.chapters).clone()).unwrap_or_default());
         let mut have = std::collections::HashSet::new();
         let mut chapters: Vec<Value> = known
             .filter(|c| {

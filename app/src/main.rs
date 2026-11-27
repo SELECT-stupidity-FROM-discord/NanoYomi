@@ -1,6 +1,7 @@
 mod browse;
 mod catalog;
 mod challenge;
+mod cache_db;
 mod covers;
 mod downloads;
 mod ext_settings;
@@ -49,9 +50,10 @@ use images::ImageCache;
 use manga::{MangaEvent, MangaView};
 use reader::{Reader, ReaderEvent};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// mimalloc hands freed decode buffers back to macOS. The system allocator sat on 341 MB.
 #[global_allocator]
@@ -183,6 +185,109 @@ pub fn pill(id: &'static str, label: impl Into<SharedString>, primary: bool) -> 
     }
 }
 
+pub(crate) struct Tip(pub SharedString);
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(u(8.))
+            .py(u(4.))
+            .rounded(u(6.))
+            .bg(rgb(SURFACE))
+            .border_1()
+            .border_color(rgb(LINE))
+            .text_size(u(12.))
+            .text_color(rgb(TEXT))
+            .child(self.0.clone())
+    }
+}
+
+/// Hover-revealed button that clears a series' reading progress from History and Continue reading.
+pub(crate) fn remove_history_button(
+    id: impl Into<gpui::ElementId>,
+    group: &'static str,
+    overlay: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .group("rm-btn")
+        .flex_none()
+        .size(u(24.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .when(overlay, |d| d.absolute().top(u(6.)).right(u(6.)))
+        .invisible()
+        .group_hover(group, |s| s.visible())
+        .tooltip(|_, cx| cx.new(|_| Tip("Remove from history".into())).into())
+        .child(
+            gpui::svg()
+                .path("icons/win-close.svg")
+                .flex_none()
+                .size(u(12.))
+                .text_color(rgb(MUTED))
+                .group_hover("rm-btn", |s| s.size(u(15.)).text_color(rgb(TEXT))),
+        )
+}
+
+/// Shared banner offering Undo after removing items from History or Continue reading.
+pub(crate) fn history_undo_banner(
+    id_prefix: &'static str,
+    store: Entity<Store>,
+    count: usize,
+) -> gpui::AnyElement {
+    let message = if count == 1 {
+        "Removed 1 series from history.".into()
+    } else {
+        format!("Cleared {count} series from history.")
+    };
+    let undo_store = store.clone();
+    div()
+        .px(u(14.))
+        .py(u(10.))
+        .rounded(u(10.))
+        .border_1()
+        .border_color(rgb(LINE))
+        .bg(rgb(SURFACE))
+        .flex()
+        .items_center()
+        .gap(u(12.))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(u(13.))
+                .text_color(rgb(BODY))
+                .child(message),
+        )
+        .child(
+            catalog::small_button(format!("{id_prefix}-undo"), "Undo", true).on_click(
+                move |_, _, cx| {
+                    undo_store.update(cx, |s, cx| s.undo_history(cx));
+                },
+            ),
+        )
+        .child(
+            div()
+                .id(format!("{id_prefix}-dismiss"))
+                .flex_none()
+                .size(u(24.))
+                .rounded(u(12.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .text_color(rgb(MUTED))
+                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                .child(gpui::svg().path("icons/win-close.svg").size(u(12.)))
+                .on_click(move |_, _, cx| {
+                    store.update(cx, |s, cx| s.dismiss_history_undo(cx));
+                }),
+        )
+        .into_any_element()
+}
+
 #[derive(Clone)]
 pub struct Source {
     pub host: Arc<Host>,
@@ -229,7 +334,77 @@ fn readable(e: &str) -> String {
     }
 }
 
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
+struct UpdateKey {
+    source: String,
+    url: String,
+    needs_details: bool,
+    needs_chapters: bool,
+    has_chapters: bool,
+}
+
+fn update_key(op: &str, params: &Value) -> Option<UpdateKey> {
+    if op != "update" {
+        return None;
+    }
+    Some(UpdateKey {
+        source: params["source"].as_str()?.to_string(),
+        url: params["manga"]["url"].as_str()?.to_string(),
+        needs_details: params["needsDetails"].as_bool().unwrap_or(true),
+        needs_chapters: params["needsChapters"].as_bool().unwrap_or(true),
+        has_chapters: params["chapters"].as_array().is_some_and(|a| !a.is_empty()),
+    })
+}
+
+type UpdateWaiters = HashMap<UpdateKey, Vec<futures::channel::oneshot::Sender<Result<Value, String>>>>;
+
+static INFLIGHT_UPDATES: LazyLock<Mutex<UpdateWaiters>> = LazyLock::new(Mutex::default);
+
+struct UpdateGuard(Option<UpdateKey>);
+
+impl Drop for UpdateGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.0.take() {
+            INFLIGHT_UPDATES.lock().unwrap().remove(&key);
+        }
+    }
+}
+
 async fn call_raw(host: &Arc<Host>, cx: &mut AsyncApp, op: &str, params: Value) -> Result<Value, String> {
+    let Some(key) = update_key(op, &params) else {
+        return call_raw_inner(host, cx, op, params).await;
+    };
+    loop {
+        let rx = {
+            let mut map = INFLIGHT_UPDATES.lock().unwrap();
+            if let Some(waiters) = map.get_mut(&key) {
+                let (tx, rx) = futures::channel::oneshot::channel();
+                waiters.push(tx);
+                Some(rx)
+            } else {
+                map.insert(key.clone(), Vec::new());
+                None
+            }
+        };
+        if let Some(rx) = rx {
+            if let Ok(res) = rx.await {
+                return res;
+            }
+            continue;
+        }
+        let mut guard = UpdateGuard(Some(key.clone()));
+        let res = call_raw_inner(host, cx, op, params).await;
+        guard.0 = None;
+        if let Some(waiters) = INFLIGHT_UPDATES.lock().unwrap().remove(&key) {
+            for tx in waiters {
+                let _ = tx.send(res.clone());
+            }
+        }
+        return res;
+    }
+}
+
+async fn call_raw_inner(host: &Arc<Host>, cx: &mut AsyncApp, op: &str, params: Value) -> Result<Value, String> {
     let mut first = host.call(op, params.clone()).await;
     // Opening a series while the Library checks it would ask twice at once, which extensions refuse. Wait instead.
     for _ in 0..60 {
@@ -288,11 +463,36 @@ async fn call_raw(host: &Arc<Host>, cx: &mut AsyncApp, op: &str, params: Value) 
 /// NANO_DEMO=<n> opens the nth popular series and pages through it (memory check).
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     #[test]
     fn errors_read_like_sentences() {
         assert_eq!(super::readable("eu.kanade.tachiyomi.network.HttpException: HTTP error 503\n\tat x"), "HTTP error 503");
         assert!(super::readable("eu.kanade.tachiyomi.network.HttpException: HTTP error 429").starts_with("The site is limiting"));
         assert_eq!(super::readable("Verification was cancelled"), "Verification was cancelled");
+    }
+
+    #[test]
+    fn update_key_matches_equivalent_requests_only() {
+        let req = |details: Option<bool>, chs: Vec<&str>| {
+            let mut v = json!({
+                "source": "7537715367149829912",
+                "manga": { "url": "/m/1" },
+                "chapters": chs.into_iter().map(|u| json!({ "url": u })).collect::<Vec<_>>(),
+            });
+            if let Some(d) = details {
+                v["needsDetails"] = json!(d);
+            }
+            v
+        };
+        assert!(super::update_key("pages", &req(None, vec![])).is_none());
+        let a = super::update_key("update", &req(None, vec!["/c1"])).unwrap();
+        let b = super::update_key("update", &req(Some(true), vec!["/c1", "/c2"])).unwrap();
+        let c = super::update_key("update", &req(Some(false), vec!["/c1"])).unwrap();
+        let d = super::update_key("update", &req(Some(true), vec![])).unwrap();
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, d);
     }
 }
 
@@ -364,9 +564,9 @@ struct Root {
 }
 
 impl Root {
-    fn new(host: Arc<Host>, data_dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(host: Arc<Host>, data_dir: PathBuf, store: Store, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let cache = cx.new(|_| ImageCache::new(images::BUDGET_BYTES));
-        let store = cx.new(|_| Store::load(data_dir.join("library.json")));
+        let store = cx.new(|_| store);
         sync::run(store.clone(), cx);
         set_zoom(store.read(cx).zoom());
         downloads::apply(&store.read(cx).prefs().download_dir, store.read(cx).prefs().download_format);
@@ -700,6 +900,7 @@ fn main() {
     let data_dir = data_dir();
     std::fs::create_dir_all(&data_dir).expect("create data dir");
     covers::set_cache_dir(data_dir.join("covers"));
+    cache_db::open(&data_dir.join("cache.db"));
     page_cache::set_dir(data_dir.join("pages"));
     downloads::set_dir(data_dir.join("downloads"));
     // Kagane serves JPEG XL, which `image` only decodes through this hook.
@@ -762,7 +963,7 @@ fn main() {
                 window_decorations: decorations,
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| Root::new(host, data_dir, window, cx)),
+            |window, cx| cx.new(|cx| Root::new(host, data_dir, first, window, cx)),
         )
         .expect("open window");
         cx.activate(true);

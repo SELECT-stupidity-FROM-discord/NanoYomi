@@ -106,11 +106,6 @@ pub fn add_repo(input: &str) -> Result<Repo, String> {
     Ok(Repo { url, name, key })
 }
 
-fn cache_file(data_dir: &Path, repo: &Repo) -> PathBuf {
-    let hash = crate::fnv(&repo.url);
-    data_dir.join("repos").join(format!("{hash:016x}.json"))
-}
-
 /// Every repo's extensions, plus a line for each repo that failed.
 pub fn fetch_index(repos: &[Repo], data_dir: &Path) -> (Vec<Ext>, Vec<String>) {
     let mut list = vec![];
@@ -118,8 +113,7 @@ pub fn fetch_index(repos: &[Repo], data_dir: &Path) -> (Vec<Ext>, Vec<String>) {
     for repo in repos {
         let fetched = get(&repo.url).and_then(Body::into_string).and_then(|text| {
             let exts = parse_index(&text, &repo.key)?;
-            let file = cache_file(data_dir, repo);
-            let _ = std::fs::create_dir_all(file.parent().unwrap_or(data_dir)).and_then(|_| std::fs::write(file, &text));
+            save_index(&repo.url, &exts);
             Ok(exts)
         });
         match fetched {
@@ -134,8 +128,72 @@ pub fn fetch_index(repos: &[Repo], data_dir: &Path) -> (Vec<Ext>, Vec<String>) {
     (list, errors)
 }
 
+/// Lists in the cache database are one string with a line each.
+fn lines(v: &[String]) -> String {
+    v.join("\n")
+}
+
+fn unlines(s: String) -> Vec<String> {
+    if s.is_empty() { vec![] } else { s.split('\n').map(str::to_string).collect() }
+}
+
+/// Remembers what a repo listed, in place of the last list.
+fn save_index(url: &str, exts: &[Ext]) {
+    crate::cache_db::with(|c| {
+        let tx = c.unchecked_transaction()?;
+        tx.execute("DELETE FROM repo_exts WHERE repo = ?1", [url])?;
+        let mut put = tx.prepare(
+            "INSERT INTO repo_exts(repo, pos, pkg, name, version, langs, nsfw, mixed, source_ids, sites, site, icon_url, jar_url, key) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        )?;
+        for (i, e) in exts.iter().enumerate() {
+            put.execute(rusqlite::params![url, i as i64, e.pkg, e.name, e.version, lines(&e.langs), e.nsfw, e.mixed, lines(&e.source_ids), lines(&e.sites), e.site, e.icon_url, e.jar_url, e.key])?;
+        }
+        drop(put);
+        tx.commit()
+    });
+}
+
+/// What a repo listed last time, only if it was listed under the key the repo has now.
+fn load_index(url: &str, key: &str) -> Vec<Ext> {
+    crate::cache_db::with(|c| {
+        let mut q = c.prepare("SELECT pkg, name, version, langs, nsfw, mixed, source_ids, sites, site, icon_url, jar_url, key FROM repo_exts WHERE repo = ?1 AND key = ?2 ORDER BY pos")?;
+        q.query_map([url, key], |r| {
+            Ok(Ext {
+                pkg: r.get(0)?,
+                name: r.get(1)?,
+                version: r.get(2)?,
+                langs: unlines(r.get(3)?),
+                nsfw: r.get(4)?,
+                mixed: r.get(5)?,
+                source_ids: unlines(r.get(6)?),
+                sites: unlines(r.get(7)?),
+                site: r.get(8)?,
+                icon_url: r.get(9)?,
+                jar_url: r.get(10)?,
+                key: r.get(11)?,
+            })
+        })?
+        .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// The saved list, or the file older versions kept in its place, which is moved into the database the first time it's read.
 fn cached(repo: &Repo, data_dir: &Path) -> Vec<Ext> {
-    std::fs::read_to_string(cache_file(data_dir, repo)).ok().and_then(|t| parse_index(&t, &repo.key).ok()).unwrap_or_default()
+    let saved = load_index(&repo.url, &repo.key);
+    if !saved.is_empty() {
+        return saved;
+    }
+    let file = legacy_file(data_dir, repo);
+    let Some(exts) = std::fs::read_to_string(&file).ok().and_then(|t| parse_index(&t, &repo.key).ok()) else { return vec![] };
+    save_index(&repo.url, &exts);
+    let _ = std::fs::remove_file(file);
+    exts
+}
+
+fn legacy_file(data_dir: &Path, repo: &Repo) -> PathBuf {
+    let hash = crate::fnv(&repo.url);
+    data_dir.join("repos").join(format!("{hash:016x}.json"))
 }
 
 pub fn cached_index(repos: &[Repo], data_dir: &Path) -> Vec<Ext> {
@@ -276,6 +334,58 @@ impl Body {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repo() -> Repo {
+        Repo { url: "https://r.example/index.json".into(), name: "R".into(), key: "ab".repeat(32) }
+    }
+
+    /// Spelled out with no `..` so a new field stops this compiling until it's saved in `save_index` and read in `load_index`.
+    fn ext(n: usize) -> Ext {
+        Ext {
+            pkg: format!("pkg.{n}"),
+            name: format!("Ext {n}"),
+            version: "1.4.2".into(),
+            langs: vec!["en".into(), "ja".into()],
+            nsfw: true,
+            mixed: true,
+            source_ids: vec!["11".into(), "22".into()],
+            sites: vec!["a.example".into(), "b.example".into()],
+            site: Some("a.example".into()),
+            icon_url: "https://i.example/icon.png".into(),
+            jar_url: "https://j.example/ext.jar".into(),
+            key: repo().key,
+        }
+    }
+
+    #[test]
+    fn a_saved_list_reads_back_whole_and_in_order() {
+        crate::cache_db::open(&std::env::temp_dir().join(format!("nano-cache-{}-exts.db", std::process::id())));
+        let list = vec![ext(2), ext(1), Ext { langs: vec![], source_ids: vec![], sites: vec![], site: None, nsfw: false, mixed: false, ..ext(3) }];
+        save_index(&repo().url, &list);
+        let back = load_index(&repo().url, &repo().key);
+        assert_eq!(format!("{back:?}"), format!("{list:?}"), "a field was not saved, add it to save_index and load_index");
+        save_index(&repo().url, &list[..1]);
+        assert_eq!(load_index(&repo().url, &repo().key).len(), 1, "a new list replaces the old one");
+        assert!(load_index(&repo().url, &"cd".repeat(32)).is_empty(), "a list saved under another key isn't trusted");
+    }
+
+    #[test]
+    fn the_file_older_versions_kept_is_moved_into_the_database() {
+        let dir = std::env::temp_dir().join(format!("nano-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = Repo { url: "https://legacy.example/index.json".into(), ..repo() };
+        std::fs::create_dir_all(dir.join("repos")).unwrap();
+        let index = serde_json::json!({ "signingKey": repo.key, "extensionList": { "extensions": [{
+            "packageName": "pkg.old", "name": "Tachiyomi: Old", "versionName": "1.0",
+            "sources": [{ "id": "5", "language": "en", "name": "Old" }], "resources": { "jarUrl": "https://j.example/old.jar" } }] } });
+        let file = legacy_file(&dir, &repo);
+        std::fs::write(&file, index.to_string()).unwrap();
+        crate::cache_db::open(&std::env::temp_dir().join(format!("nano-cache-{}-exts.db", std::process::id())));
+        assert_eq!(cached(&repo, &dir).iter().map(|e| e.pkg.as_str()).collect::<Vec<_>>(), ["pkg.old"]);
+        assert!(!file.exists(), "the old file is gone once it's imported");
+        assert_eq!(cached(&repo, &dir).len(), 1, "and the list now comes from the database");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn only_the_pinned_key_is_accepted() {

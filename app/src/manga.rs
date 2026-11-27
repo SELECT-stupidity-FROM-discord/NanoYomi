@@ -83,6 +83,12 @@ pub struct MangaView {
     built: Option<u64>,
     /// The search text the rows are filtered by.
     query: String,
+    groups: Vec<(String, usize)>,
+    desc_blocks: Vec<crate::rich::Block>,
+    dl_completed_gen: u64,
+    had_active_downloads: bool,
+    to_download: usize,
+    to_download_dirty: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -99,10 +105,15 @@ impl MangaView {
     }
 
     fn build(source: Source, cache: Entity<ImageCache>, store: Entity<Store>, manga: Value, local: Option<Vec<Value>>, cx: &mut Context<Self>) -> Self {
+        let is_local = local.is_some();
         // Saved series show their stored chapters straight away until the update below lands.
         let saved = store.read(cx).get(&source.id, manga["url"].as_str().unwrap_or_default()).cloned();
         let search = cx.new(|cx| TextInput::new("Search chapters…", cx));
         let downloads = crate::downloads::get(cx);
+        let (dl_completed_gen, had_active_downloads) = {
+            let dl = downloads.read(cx);
+            (dl.completed_gen, dl.touches_series(&source.id, manga["title"].as_str().unwrap_or_default()))
+        };
         let subs = vec![
             cx.observe(&store, |this, _, cx| this.changed(cx)),
             cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify()),
@@ -114,11 +125,13 @@ impl MangaView {
                     this.changed(cx);
                 }
             }),
-            cx.observe(&downloads, |this, _, cx| this.refresh_downloaded(cx)),
+            cx.observe(&downloads, |this, downloads, cx| this.on_downloads(downloads, cx)),
         ];
         let call_source = source.clone();
-        let request = json!({ "manga": manga, "chapters": [] });
-        let installed = source.installed && local.is_none();
+        let req_manga = saved.as_ref().map_or(&manga, |s| &s.manga);
+        let req_chapters: &[Value] = saved.as_ref().map_or(&[], |s| s.chapters.as_slice());
+        let request = json!({ "manga": req_manga, "chapters": req_chapters });
+        let installed = source.installed && !is_local;
         cx.spawn(async move |this, cx| {
             if !installed {
                 return; // extension's gone, so show what was saved
@@ -128,7 +141,9 @@ impl MangaView {
                 match result {
                     Ok(v) => {
                         this.manga = v["manga"].clone();
+                        this.desc_blocks = this.manga["description"].as_str().filter(|t| !t.trim().is_empty()).map(crate::rich::parse).unwrap_or_default();
                         this.chapters = Arc::new(v["chapters"].as_array().cloned().unwrap_or_default());
+                        this.groups = scanlator_counts(&this.chapters);
                         if !this.chosen {
                             let reading = this.store.read(cx).get(&this.source.id, this.url()).and_then(|s| s.progress.as_ref().map(|p| p.chapter_url.clone()));
                             this.hidden = default_hidden(&this.chapters, reading.as_deref());
@@ -146,7 +161,7 @@ impl MangaView {
             });
         })
         .detach();
-        let status = if local.is_some() {
+        let status = if is_local {
             String::new()
         } else if !source.installed {
             format!("{} isn't installed. Showing what was saved.", source.name)
@@ -156,16 +171,19 @@ impl MangaView {
             "loading chapters…".into()
         };
         let downloaded = crate::downloads::downloaded(&source, manga["title"].as_str().unwrap_or_default());
+        let chapters = local.map(Arc::new).or_else(|| saved.as_ref().map(|s| s.chapters.clone())).unwrap_or_default();
+        let groups = scanlator_counts(&chapters);
+        let desc_blocks = manga["description"].as_str().filter(|t| !t.trim().is_empty()).map(crate::rich::parse).unwrap_or_default();
         MangaView {
             source,
             cache,
             store,
             covers: Covers::default(),
             manga,
-            chapters: Arc::new(local.clone().or_else(|| saved.as_ref().map(|s| s.chapters.clone())).unwrap_or_default()),
-            hidden: if local.is_some() { vec![] } else { saved.as_ref().map(|s| s.hidden()).unwrap_or_default() },
-            chosen: local.is_some() || saved.as_ref().is_some_and(|s| s.scanlators_chosen),
-            local: local.is_some(),
+            chapters,
+            hidden: if is_local { vec![] } else { saved.as_ref().map(|s| s.hidden()).unwrap_or_default() },
+            chosen: is_local || saved.as_ref().is_some_and(|s| s.scanlators_chosen),
+            local: is_local,
             // NANO_DEMO_MODE=series-menu opens with the scanlator menu shown (for testing).
             menu: crate::demo_mode() == "series-menu",
             menu_closed: None,
@@ -191,6 +209,12 @@ impl MangaView {
             data_gen: 0,
             built: None,
             query: String::new(),
+            groups,
+            desc_blocks,
+            dl_completed_gen,
+            had_active_downloads,
+            to_download: 0,
+            to_download_dirty: true,
             _subs: subs,
         }
     }
@@ -203,7 +227,7 @@ impl MangaView {
             if store.get(&source.id, manga["url"].as_str().unwrap_or_default()).is_some() {
                 store.update(&source.id, &source.name, &manga, cx, |s| {
                     s.manga = manga.clone();
-                    s.chapters = chapters.to_vec();
+                    s.chapters = chapters;
                     s.hidden_scanlators = hidden;
                     s.scanlators_chosen = chosen;
                     f(s);
@@ -243,12 +267,45 @@ impl MangaView {
 
     fn refresh_downloaded(&mut self, cx: &mut Context<Self>) {
         self.downloaded = crate::downloads::downloaded(&self.source, &self.title());
+        self.to_download_dirty = true;
         self.changed(cx);
+    }
+
+    fn on_downloads(&mut self, downloads: Entity<crate::downloads::Downloads>, cx: &mut Context<Self>) {
+        let title = self.title();
+        let (completed_gen, last_completed, touches) = {
+            let dl = downloads.read(cx);
+            (dl.completed_gen, dl.last_completed.clone(), dl.touches_series(&self.source.id, &title))
+        };
+        let mut notify = false;
+        if completed_gen != self.dl_completed_gen {
+            self.dl_completed_gen = completed_gen;
+            if let Some((sid, t, ch_name)) = last_completed
+                && sid == self.source.id
+                && t == title
+            {
+                self.downloaded.insert(ch_name);
+                self.to_download_dirty = true;
+                if self.local {
+                    self.data_gen += 1;
+                }
+                notify = true;
+            }
+        }
+        if touches || self.had_active_downloads {
+            self.had_active_downloads = touches;
+            self.to_download_dirty = true;
+            notify = true;
+        }
+        if notify {
+            cx.notify();
+        }
     }
 
     /// Something the chapter rows are built from changed.
     fn changed(&mut self, cx: &mut Context<Self>) {
         self.data_gen += 1;
+        self.to_download_dirty = true;
         cx.notify();
     }
 
@@ -453,7 +510,7 @@ impl MangaView {
         let states = &crate::downloads::get(cx).read(cx).states;
         (0..self.visible.len())
             .rev()
-            .filter(|&i| !self.read.get(i).copied().unwrap_or(false) && !self.is_downloaded(i) && !states.contains_key(&self.url_of(i)))
+            .filter(|&i| !self.read.get(i).copied().unwrap_or(false) && !self.is_downloaded(i) && !states.contains_key(self.visible[i]["url"].as_str().unwrap_or_default()))
             .collect()
     }
 
@@ -650,13 +707,12 @@ impl MangaView {
     }
 
     fn bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let groups = scanlator_counts(&self.chapters);
         let note = if self.visible.len() == self.chapters.len() {
             format!("{}", self.chapters.len())
         } else {
             format!("{} of {}", self.visible.len(), self.chapters.len())
         };
-        let picker = (groups.len() > 1).then(|| self.scanlator_menu(groups, cx));
+        let picker = (self.groups.len() > 1).then(|| self.scanlator_menu(&self.groups.clone(), cx));
         let oldest_first = self.store.read(cx).prefs().chapters_oldest_first;
         let sort = div()
             .id("sort-chapters")
@@ -690,7 +746,7 @@ impl MangaView {
             .into_any_element()
     }
 
-    fn scanlator_menu(&mut self, groups: Vec<(String, usize)>, cx: &mut Context<Self>) -> AnyElement {
+    fn scanlator_menu(&mut self, groups: &[(String, usize)], cx: &mut Context<Self>) -> AnyElement {
         let shown: Vec<&String> = groups.iter().map(|(g, _)| g).filter(|g| !self.hidden.contains(g)).collect();
         let label = match shown.len() {
             n if n == groups.len() => "All scanlators".to_string(),
@@ -788,13 +844,19 @@ impl MangaView {
         let url = self.manga["thumbnailUrl"].as_str().map(str::to_string);
         let fetch = self.source.installed.then(|| Fetch::Cover(self.source.clone()));
         let cover = self.covers.get(&self.cache, fetch, url.as_deref(), |m: &mut MangaView| &mut m.covers, cx);
-        let saved = self.store.read(cx).get(&self.source.id, self.url()).cloned();
-        let in_library = saved.as_ref().is_some_and(|s| s.in_library);
+        let (has_saved, in_library, tracked, resume) = {
+            let store = self.store.read(cx);
+            match store.get(&self.source.id, self.url()) {
+                Some(s) => {
+                    let resume = s.progress.as_ref().and_then(|p| {
+                        Some((self.visible.iter().position(|c| c["url"] == p.chapter_url.as_str())?, p.page, p.chapter_name.clone()))
+                    });
+                    (true, s.in_library, !s.tracks.is_empty(), resume)
+                }
+                None => (false, false, false, None),
+            }
+        };
         let installed = self.source.installed || self.local;
-        let resume = saved.as_ref().and_then(|s| {
-            let p = s.progress.as_ref()?;
-            Some((self.visible.iter().position(|c| c["url"] == p.chapter_url.as_str())?, p.page, p.chapter_name.clone()))
-        });
         let status = match self.manga["status"].as_i64() {
             Some(1) => "ongoing",
             Some(2) => "completed",
@@ -823,7 +885,19 @@ impl MangaView {
             .unwrap_or_default();
         let title = self.text("title").unwrap_or_default();
         let has_chapters = !self.visible.is_empty();
-        let to_download = self.unread_not_downloaded(cx).len();
+        if self.to_download_dirty {
+            let states = &crate::downloads::get(cx).read(cx).states;
+            self.to_download = (0..self.visible.len())
+                .rev()
+                .filter(|&i| {
+                    !self.read.get(i).copied().unwrap_or(false)
+                        && !self.is_downloaded(i)
+                        && !states.contains_key(self.visible[i]["url"].as_str().unwrap_or_default())
+                })
+                .count();
+            self.to_download_dirty = false;
+        }
+        let to_download = self.to_download;
 
         div()
             .w_full()
@@ -926,17 +1000,16 @@ impl MangaView {
                             )
                             .when(in_library, |d| d.child(self.categories_button(cx)))
                             .when(in_library, |d| {
-                                let tracked = saved.as_ref().is_some_and(|s| !s.tracks.is_empty());
                                 d.child(
                                     pill("tracking", if tracked { "Tracked" } else { "Tracking" }, false)
                                         .when(tracked, |d| d.gap_2().child(crate::check(16., TEXT)).flex_row_reverse())
                                         .on_click(cx.listener(|this, _, _, cx| this.open_tracking(cx))),
                                 )
                             })
-                            .when(installed && saved.is_some(), |d| d.child(pill("migrate", "Migrate", false).on_click(cx.listener(|_, _, _, cx| cx.emit(MangaEvent::Migrate))))),
+                            .when(installed && has_saved, |d| d.child(pill("migrate", "Migrate", false).on_click(cx.listener(|_, _, _, cx| cx.emit(MangaEvent::Migrate))))),
             )
-            .when_some(self.text("description"), |d, t| {
-                d.child(div().text_size(u(14.)).line_height(relative(1.55)).text_color(rgb(BODY)).child(crate::rich::render(&t)))
+            .when(!self.desc_blocks.is_empty(), |d| {
+                d.child(div().text_size(u(14.)).line_height(relative(1.55)).text_color(rgb(BODY)).child(crate::rich::render_blocks(&self.desc_blocks)))
             })
             .into_any_element()
     }
@@ -967,6 +1040,7 @@ impl Render for MangaView {
             if self.store.read(cx).prefs().chapters_oldest_first {
                 self.rows.reverse();
             }
+            self.to_download_dirty = true;
             self.built = Some(self.data_gen);
         }
         let mut items = vec![Item::Hero, Item::Bar, Item::Header];

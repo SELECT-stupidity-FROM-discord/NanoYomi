@@ -3,6 +3,7 @@ package android.graphics;
 import java.awt.Color;
 import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
+import java.awt.image.DataBufferInt;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.Buffer;
@@ -15,6 +16,7 @@ import javax.imageio.ImageWriter;
 
 /** Pixels in an ARGB BufferedImage, so extensions can unscramble pages: decode, redraw tiles, encode. */
 public final class Bitmap {
+    static { ImageIO.setUseCache(false); }
     public enum Config { ALPHA_8, RGB_565, ARGB_4444, ARGB_8888, RGBA_F16, HARDWARE }
     public enum CompressFormat { JPEG, PNG, WEBP, WEBP_LOSSY, WEBP_LOSSLESS }
 
@@ -94,10 +96,17 @@ public final class Bitmap {
         image.setRGB(x, y, width, height, pixels, offset, stride);
     }
 
+    private int[] directPixels() {
+        return image.getType() == BufferedImage.TYPE_INT_ARGB && image.getRaster().getDataBuffer() instanceof DataBufferInt db
+            ? db.getData()
+            : null;
+    }
+
     /** ARGB_8888 in memory is R, G, B, A bytes, as on Android. */
     public void copyPixelsFromBuffer(Buffer src) {
-        int w = getWidth(), n = w * getHeight();
-        int[] px = new int[n];
+        int w = getWidth(), h = getHeight(), n = w * h;
+        int[] direct = directPixels();
+        int[] px = direct != null ? direct : new int[n];
         if (src instanceof ByteBuffer b) {
             for (int i = 0; i < n && b.remaining() >= 4; i++) {
                 int r = b.get() & 0xff, g = b.get() & 0xff, bl = b.get() & 0xff, a = b.get() & 0xff;
@@ -110,12 +119,13 @@ public final class Bitmap {
                 px[i] = (v & 0xff00ff00) | (v & 0xff) << 16 | (v >> 16) & 0xff;
             }
         }
-        image.setRGB(0, 0, w, getHeight(), px, 0, w);
+        if (direct == null) image.setRGB(0, 0, w, h, px, 0, w);
     }
 
     public void copyPixelsToBuffer(Buffer dst) {
-        int w = getWidth(), n = w * getHeight();
-        int[] px = image.getRGB(0, 0, w, getHeight(), null, 0, w);
+        int w = getWidth(), h = getHeight(), n = w * h;
+        int[] px = directPixels();
+        if (px == null) px = image.getRGB(0, 0, w, h, null, 0, w);
         if (dst instanceof ByteBuffer b) {
             for (int i = 0; i < n && b.remaining() >= 4; i++) {
                 int v = px[i];

@@ -61,7 +61,7 @@ object BrowserFetch {
         }
     }
 
-    /** One view per site. It opens the first page asked for and waits for it to stop being a check. */
+    /** One view per site. It opens the site's front page and waits for it to stop being a check, then fetch() runs from there. */
     private class Session(host: String, val origin: String, start: String) {
         val view = WebView(Application())
         val ready = CompletableFuture<Unit>()
@@ -89,7 +89,7 @@ object BrowserFetch {
     fun fetch(req: Request): Response {
         val url = req.url
         val origin = "${url.scheme}://${url.host}" + if (url.port == okhttp3.HttpUrl.defaultPort(url.scheme)) "" else ":${url.port}"
-        val session = views.computeIfAbsent(url.host) { Session(url.host, origin, url.toString()) }
+        val session = views.computeIfAbsent(url.host) { Session(url.host, origin, "$origin/") }
         try {
             session.ready.get(60, TimeUnit.SECONDS)
         } catch (e: Exception) {

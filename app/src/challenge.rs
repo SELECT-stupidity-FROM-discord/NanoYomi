@@ -39,7 +39,17 @@ pub struct Check {
     site: String,
     root: WeakEntity<crate::Root>,
     store: Entity<Store>,
+    /// Set when the user closes the panel's own window.
+    #[cfg(target_os = "linux")]
+    closed: Arc<std::sync::atomic::AtomicBool>,
     _sub: Subscription,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Check {
+    fn drop(&mut self) {
+        crate::webviews::native::close(&self.webview);
+    }
 }
 
 pub fn browser_user_agent(_extension_agent: String) -> String {
@@ -73,7 +83,12 @@ fn open(cx: &mut App, host: Arc<Host>, url: String, user_agent: String, title: &
         if !user_agent.is_empty() {
             builder = builder.with_user_agent(&user_agent);
         }
-        let webview = match builder.build_as_child(window) {
+        // Linux can't embed WebKitGTK in gpui's window, so the panel's view lives in its own window.
+        #[cfg(target_os = "linux")]
+        let built = crate::webviews::native::build(builder, 600., 724.);
+        #[cfg(not(target_os = "linux"))]
+        let built = builder.build_as_child(window);
+        let webview = match built {
             Ok(wv) => wv,
             Err(e) => {
                 eprintln!("system webview unavailable: {e}");
@@ -101,6 +116,10 @@ impl Check {
         let sign_in = matches!(mode, Mode::SignIn);
         let site = url.split("//").nth(1).and_then(|r| r.split('/').next()).unwrap_or(&url).to_string();
         let close_root = root.clone();
+        #[cfg(target_os = "linux")]
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(target_os = "linux")]
+        let watch_closed = closed.clone();
 
         cx.spawn_in(window, async move |this, cx| {
             let mut tx = match mode {
@@ -130,6 +149,14 @@ impl Check {
             };
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
+                #[cfg(target_os = "linux")]
+                if watch_closed.load(Ordering::Relaxed) {
+                    finish(cx);
+                    if sign_in {
+                        break;
+                    }
+                    return;
+                }
                 if !sign_in && !shown && started.elapsed() > PILL_AFTER {
                     let _ = this.update(cx, |this: &mut Check, cx| {
                         this.waiting = true;
@@ -217,7 +244,7 @@ impl Check {
         .detach();
 
         let sub = cx.observe(&store, |_, _, cx| cx.notify());
-        Check { webview, title, shown: sign_in, waiting: false, site, root, store, _sub: sub }
+        Check { webview, title, shown: sign_in, waiting: false, site, root, store, #[cfg(target_os = "linux")] closed, _sub: sub }
     }
 }
 
@@ -235,6 +262,11 @@ impl Render for Check {
         let (x, y, w, h) = panel(crate::titlebar::viewport(window));
         let (left, top) = crate::titlebar::origin(window);
         let head = f32::from(u(56.));
+        #[cfg(target_os = "linux")]
+        if self.shown {
+            let closed = self.closed.clone();
+            crate::webviews::native::present(&self.webview, self.title, move || closed.store(true, Ordering::Relaxed));
+        }
         if self.shown {
             let _ = self.webview.set_bounds(bounds(left + x, top + y + head, w, h - head));
         } else {

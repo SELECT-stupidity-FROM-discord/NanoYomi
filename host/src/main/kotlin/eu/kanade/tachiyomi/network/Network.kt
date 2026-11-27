@@ -113,11 +113,17 @@ class UserAgentOverrides(private val file: File) : okhttp3.Interceptor {
 class CloudflareChallengeException(val url: String, val userAgent: String) :
     java.io.IOException("Cloudflare challenge at $url")
 
+/** OkHttp can't pass for a browser whose user agent extensions don't recognise, so the browser makes the site's requests. */
+private fun passedWithUnknownBrowser(host: String): Boolean {
+    val ua = Injekt.get<NetworkHelper>().userAgents.forHost(host) ?: return false
+    return !Regex("Chrome/|Chromium/|Firefox/|\\((iPhone|iPad|iPod|Macintosh);").containsMatchIn(ua)
+}
+
 /** Reports a Cloudflare challenge page instead of handing its HTML to the extension. */
 class CloudflareInterceptor : okhttp3.Interceptor {
     override fun intercept(chain: okhttp3.Interceptor.Chain): okhttp3.Response {
         val req = chain.request()
-        if (BrowserFetch.handles(req.url.host)) return BrowserFetch.fetch(req)
+        if (BrowserFetch.handles(req.url.host) || passedWithUnknownBrowser(req.url.host)) return BrowserFetch.fetch(req)
         val res = chain.proceed(req)
         if (res.code in setOf(403, 503) && res.header("Server").orEmpty().startsWith("cloudflare") &&
             (res.header("cf-mitigated") == "challenge" || res.header("Content-Type").orEmpty().startsWith("text/html"))

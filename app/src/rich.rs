@@ -285,16 +285,16 @@ fn render_rtl_block(block_ix: usize, b: &Block) -> impl IntoElement {
         .children(items)
 }
 
-pub fn render(src: &str) -> impl IntoElement {
+pub fn render_blocks(blocks: &[Block]) -> gpui::Div {
     div()
         .w_full()
         .flex()
         .flex_col()
         .gap(u(2.))
-        .children(parse(src).into_iter().enumerate().map(|(i, b)| {
+        .children(blocks.iter().enumerate().map(|(i, b)| {
             let row = div().w_full().flex().when(b.gap, |d| d.mt(u(12.)));
             if is_rtl_block(&b.text) {
-                let content = render_rtl_block(i, &b);
+                let content = render_rtl_block(i, b);
                 return if b.bullet {
                     row.flex_row_reverse()
                         .gap(u(8.))
@@ -309,7 +309,7 @@ pub fn render(src: &str) -> impl IntoElement {
             let urls: Vec<String> = b.links.iter().map(|l| l.1.clone()).collect();
             let ranges: Vec<Range<usize>> = b.links.iter().map(|l| l.0.clone()).collect();
             let text =
-                StyledText::new(SharedString::from(b.text.clone())).with_highlights(highlights(&b));
+                StyledText::new(SharedString::from(b.text.clone())).with_highlights(highlights(b));
             let text =
                 InteractiveText::new(("desc", i), text).on_click(ranges, move |ix, _, cx| {
                     let url = &urls[ix];

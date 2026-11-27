@@ -64,10 +64,10 @@ fun main(args: Array<String>) {
     downloadsDir().deleteRecursively() // leftovers from a run that crashed before the app read them
     val json = Json { ignoreUnknownKeys = true; explicitNulls = false }
     Injekt.addSingleton<Application>(app)
-    Injekt.addSingletonFactory { NetworkHelper(app) }
-    Injekt.addSingletonFactory { json }
+    Injekt.addSingleton(NetworkHelper(app))
+    Injekt.addSingleton(json)
     // Mihon provides these too, and extensions fetch them by type (MANGA Plus needs ProtoBuf).
-    Injekt.addSingletonFactory<kotlinx.serialization.protobuf.ProtoBuf> { kotlinx.serialization.protobuf.ProtoBuf }
+    Injekt.addSingleton<kotlinx.serialization.protobuf.ProtoBuf>(kotlinx.serialization.protobuf.ProtoBuf)
 
     val host = Host()
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -114,8 +114,12 @@ fun main(args: Array<String>) {
     kotlin.system.exitProcess(0)
 }
 
+private val PKG_RE = Regex("""package="([^"]+)"""")
+private val ENTRY_RE = Regex("""android:name="tachiyomi\.extension\.class"\s+android:value="([^"]+)"""")
+
 class Host {
     private val sources = ConcurrentHashMap<String, Source>()
+    private val instantiateLock = Any()
 
     suspend fun handle(req: JsonObject): JsonElement {
         fun str(k: String) = req[k]?.jsonPrimitive?.content ?: throw IllegalArgumentException("missing '$k'")
@@ -198,34 +202,41 @@ class Host {
     private fun load(jar: File, signingKey: String): List<Source> {
         val manifest = JarFile(jar, true).use { jf ->
             val signers = mutableSetOf<String>()
+            val seenCerts = HashSet<java.security.cert.Certificate>()
+            val buf = ByteArray(8192)
             for (entry in jf.entries()) {
                 if (entry.isDirectory || entry.name.startsWith("META-INF/")) continue
-                jf.getInputStream(entry).use { it.readAllBytes() } // reading verifies the entry's digest
+                jf.getInputStream(entry).use { while (it.read(buf) >= 0) {} } // reading verifies the entry's digest
                 val certs = entry.codeSigners?.map { it.signerCertPath.certificates.first() }
                     ?: throw SecurityException("unsigned entry ${entry.name}")
-                certs.forEach { signers += sha256(it.encoded) }
+                for (cert in certs) {
+                    if (seenCerts.add(cert)) signers += sha256(cert.encoded)
+                }
             }
             if (signers != setOf(signingKey.lowercase())) throw SecurityException("signer $signers does not match $signingKey")
             jf.getInputStream(jf.getEntry("AndroidManifest.xml") ?: throw IllegalArgumentException("no AndroidManifest.xml"))
                 .use { it.readAllBytes().toString(Charsets.UTF_8) }
         }
-        val pkg = Regex("""package="([^"]+)"""").find(manifest)?.groupValues?.get(1)
-        val entry = Regex("""android:name="tachiyomi\.extension\.class"\s+android:value="([^"]+)"""").find(manifest)
-            ?.groupValues?.get(1) ?: throw IllegalArgumentException("no tachiyomi.extension.class in manifest")
+        val pkg = PKG_RE.find(manifest)?.groupValues?.get(1)
+        val entry = ENTRY_RE.find(manifest)?.groupValues?.get(1)
+            ?: throw IllegalArgumentException("no tachiyomi.extension.class in manifest")
         // One class loader per jar, never closed. Fine while updates need a restart.
         val loader = URLClassLoader(arrayOf(jar.toURI().toURL()), Host::class.java.classLoader)
-        val list = entry.split(';').map { if (it.startsWith(".")) pkg + it else it }.flatMap { name ->
-            when (val obj = loader.loadClass(name).getDeclaredConstructor().newInstance()) {
-                is SourceFactory -> obj.createSources()
-                is Source -> listOf(obj)
-                else -> throw IllegalArgumentException("$name is not a Source")
+        val list = synchronized(instantiateLock) {
+            entry.split(';').map { if (it.startsWith(".")) pkg + it else it }.flatMap { name ->
+                when (val obj = loader.loadClass(name).getDeclaredConstructor().newInstance()) {
+                    is SourceFactory -> obj.createSources()
+                    is Source -> listOf(obj)
+                    else -> throw IllegalArgumentException("$name is not a Source")
+                }
             }
         }
         list.forEach { sources[it.id.toString()] = it }
         return list
     }
 
-    private fun sha256(b: ByteArray) = MessageDigest.getInstance("SHA-256").digest(b).joinToString("") { "%02x".format(it) }
+    private fun sha256(b: ByteArray) =
+        java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(b))
 }
 
 private fun downloadsDir() = File(Application().cacheDir, "downloads").apply { mkdirs() }

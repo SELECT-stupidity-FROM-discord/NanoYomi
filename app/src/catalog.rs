@@ -14,7 +14,8 @@ use gpui::{
     ObjectFit, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription,
     Window, div, img, list, prelude::FluentBuilder, rgb,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 const PAD: f32 = 40.;
 const GAP: f32 = 16.;
@@ -58,6 +59,13 @@ pub struct Catalog {
     /// An extension's settings drawer, while open.
     settings: Option<(Entity<crate::ext_settings::ExtSettings>, Subscription)>,
     nsfw: bool,
+    data_gen: u64,
+    index_key: Option<(usize, usize)>,
+    index_len: usize,
+    expanded: Vec<Ext>,
+    known_pkgs: HashSet<String>,
+    top_langs: Vec<String>,
+    built_list: Option<(u64, String, Option<String>, bool)>,
     _subs: Vec<Subscription>,
 }
 
@@ -72,8 +80,14 @@ impl Catalog {
             i
         });
         let subs = vec![
-            cx.observe(&registry, |_, _, cx| cx.notify()),
-            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.observe(&registry, |this, _, cx| {
+                this.data_gen += 1;
+                cx.notify();
+            }),
+            cx.observe(&store, |this, _, cx| {
+                this.data_gen += 1;
+                cx.notify();
+            }),
             cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&repo_input, |this, _, _: &InputEvent, cx| this.add_repo(cx)),
         ];
@@ -99,6 +113,13 @@ impl Catalog {
             lang: None,
             settings: None,
             nsfw: false,
+            data_gen: 0,
+            index_key: None,
+            index_len: 0,
+            expanded: vec![],
+            known_pkgs: HashSet::new(),
+            top_langs: vec![],
+            built_list: None,
             _subs: subs,
         }
     }
@@ -479,43 +500,72 @@ impl Render for Catalog {
             self.list.remeasure();
         }
         let query = self.search.read(cx).text.trim().to_lowercase();
-        let registry = self.registry.read(cx);
-        let index = registry.index.clone().unwrap_or_default();
-        let flags = self.store.read(cx).prefs().nsfw;
-        let (hide, mixed) = (flags.get(crate::store::Area::Extensions), flags.mixed);
-        let flagged = move |e: &Ext| hide && (e.nsfw || (mixed && e.mixed));
-        let (lang, nsfw) = (self.lang.clone(), self.nsfw);
-        let matches = |e: &Ext| {
-            (query.is_empty() || e.name.to_lowercase().contains(&query))
-                && lang.as_ref().is_none_or(|l| e.langs.iter().any(|x| x == l || x == "all"))
-                && (nsfw || !e.nsfw) && !flagged(e)
-        };
-        let store = self.store.read(cx);
-        let is_on = |r: &Ext| registry.installed.contains(&r.pkg) && r.site.as_ref().is_none_or(|s| store.sites(&r.pkg).is_none_or(|on| on.contains(s)));
-        self.installed = index.iter().filter(|e| !flagged(e)).flat_map(Ext::rows).filter(|r| is_on(r)).collect();
-        let mut orphans: Vec<&String> = registry.installed.iter().filter(|p| !index.iter().any(|e| &e.pkg == *p)).collect();
-        orphans.sort();
-        for pkg in orphans {
-            let name = registry.sources.iter().find(|s| &s.pkg == pkg).map_or_else(|| pkg.rsplit('.').next().unwrap_or(pkg).to_string(), |s| s.name.clone());
-            let langs = registry.languages(pkg);
-            self.installed.push(Ext::orphan(pkg, &name, registry.versions.get(pkg).map_or("", |v| v.as_str()), langs));
+        let index_opt = self.registry.read(cx).index.clone();
+        let next_key = index_opt.as_ref().map(|idx| (Arc::as_ptr(idx) as usize, idx.len()));
+        if self.index_key != next_key {
+            self.index_key = next_key;
+            self.data_gen += 1;
+            if let Some(index) = index_opt.as_deref() {
+                self.index_len = index.len();
+                self.expanded = index.iter().flat_map(Ext::rows).collect();
+                self.known_pkgs = index.iter().map(|e| e.pkg.clone()).collect();
+                let mut counts: HashMap<&str, usize> = HashMap::new();
+                for l in index.iter().flat_map(|e| e.langs.iter()).filter(|l| *l != "all") {
+                    *counts.entry(l.as_str()).or_default() += 1;
+                }
+                let mut top: Vec<(&str, usize)> = counts.into_iter().collect();
+                top.sort_by_key(|(l, n)| (std::cmp::Reverse(*n), *l));
+                self.top_langs = top.into_iter().take(12).map(|(l, _)| l.to_string()).collect();
+            } else {
+                self.index_len = 0;
+                self.expanded.clear();
+                self.known_pkgs.clear();
+                self.top_langs.clear();
+            }
         }
-        self.available = index.iter().flat_map(Ext::rows).filter(|r| !is_on(r) && matches(r)).collect();
+        let list_key = (self.data_gen, query, self.lang.clone(), self.nsfw);
+        if self.built_list.as_ref() != Some(&list_key) {
+            let query = &list_key.1;
+            let registry = self.registry.read(cx);
+            let store = self.store.read(cx);
+            let flags = store.prefs().nsfw;
+            let (hide, mixed) = (flags.get(crate::store::Area::Extensions), flags.mixed);
+            let flagged = |e: &Ext| hide && (e.nsfw || (mixed && e.mixed));
+            let is_on = |r: &Ext| registry.installed.contains(&r.pkg) && r.site.as_ref().is_none_or(|s| store.sites(&r.pkg).is_none_or(|on| on.contains(s)));
+            let matches = |e: &Ext| {
+                (query.is_empty() || e.name.to_lowercase().contains(query))
+                    && list_key.2.as_ref().is_none_or(|l| e.langs.iter().any(|x| x == l || x == "all"))
+                    && (list_key.3 || !e.nsfw) && !flagged(e)
+            };
+            self.installed.clear();
+            self.available.clear();
+            for r in &self.expanded {
+                if is_on(r) {
+                    if !flagged(r) {
+                        self.installed.push(r.clone());
+                    }
+                } else if matches(r) {
+                    self.available.push(r.clone());
+                }
+            }
+            let mut orphans: Vec<&String> = registry.installed.iter().filter(|p| !self.known_pkgs.contains(*p)).collect();
+            orphans.sort();
+            for pkg in orphans {
+                let name = registry.sources.iter().find(|s| &s.pkg == pkg).map_or_else(|| pkg.rsplit('.').next().unwrap_or(pkg).to_string(), |s| s.name.clone());
+                let langs = registry.languages(pkg);
+                self.installed.push(Ext::orphan(pkg, &name, registry.versions.get(pkg).map_or("", |v| v.as_str()), langs));
+            }
+            self.built_list = Some(list_key);
+        }
         (self.cols, self.card_w) = grid(crate::content_width(window), PAD, GAP, CARD_MIN);
-
-        let mut counts: HashMap<&str, usize> = HashMap::new();
-        for l in index.iter().flat_map(|e| e.langs.iter()).filter(|l| *l != "all") {
-            *counts.entry(l.as_str()).or_default() += 1;
-        }
-        let mut top: Vec<(&str, usize)> = counts.into_iter().collect();
-        top.sort_by_key(|(l, n)| (std::cmp::Reverse(*n), *l));
-        let top: Vec<String> = top.into_iter().take(12).map(|(l, _)| l.to_string()).collect();
+        let (lang, nsfw) = (self.lang.clone(), self.nsfw);
+        let top = &self.top_langs;
 
         let repos = self.store.read(cx).repos().len();
         let note = match repos {
             0 => format!("{} installed · no repos yet", self.installed.len()),
-            1 => format!("{} installed · {} in 1 repo", self.installed.len(), index.len()),
-            n => format!("{} installed · {} in {n} repos", self.installed.len(), index.len()),
+            1 => format!("{} installed · {} in 1 repo", self.installed.len(), self.index_len),
+            n => format!("{} installed · {} in {n} repos", self.installed.len(), self.index_len),
         };
 
         let mut items = vec![];
@@ -558,10 +608,11 @@ impl Render for Catalog {
                             this.lang = None;
                             cx.notify();
                         })))
-                        .children(top.into_iter().map(|l| {
+                        .children(top.iter().map(|l| {
                             let on = lang.as_deref() == Some(l.as_str());
+                            let l_click = l.clone();
                             chip(SharedString::from(format!("filter-{l}")), l.clone(), on).on_click(cx.listener(move |this, _, _, cx| {
-                                this.lang = if on { None } else { Some(l.clone()) };
+                                this.lang = if on { None } else { Some(l_click.clone()) };
                                 cx.notify();
                             }))
                         }))

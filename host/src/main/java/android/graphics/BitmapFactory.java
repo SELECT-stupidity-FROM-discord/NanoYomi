@@ -9,6 +9,7 @@ import javax.imageio.stream.ImageInputStream;
 
 /** Decodes with ImageIO: JPEG, PNG, GIF and BMP, plus WebP through the TwelveMonkeys plugin. Null when it can't, as on Android. */
 public class BitmapFactory {
+    static { ImageIO.setUseCache(false); }
     public static class Options {
         public boolean inJustDecodeBounds;
         public boolean inMutable;

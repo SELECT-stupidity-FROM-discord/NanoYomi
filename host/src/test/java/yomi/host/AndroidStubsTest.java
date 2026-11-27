@@ -67,12 +67,29 @@ class AndroidStubsTest {
     }
 
     @Test void rgbaBuffersRoundTrip() {
-        Bitmap b = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888);
-        b.copyPixelsFromBuffer(ByteBuffer.wrap(new byte[] { 0x11, 0x22, 0x33, (byte) 0xff }));
+        Bitmap b = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888);
+        byte[] raw = {
+            0x11, 0x22, 0x33, (byte) 0xff,
+            0x44, 0x55, 0x66, (byte) 0x80,
+            0x77, (byte) 0x88, (byte) 0x99, 0x10,
+            0x01, 0x02, 0x03, 0x00,
+        };
+        b.copyPixelsFromBuffer(ByteBuffer.wrap(raw));
         assertEquals(0xff112233, b.getPixel(0, 0));
-        ByteBuffer back = ByteBuffer.allocate(4);
+        assertEquals(0x80445566, b.getPixel(1, 0));
+        assertEquals(0x10778899, b.getPixel(0, 1));
+        assertEquals(0x00010203, b.getPixel(1, 1));
+        ByteBuffer back = ByteBuffer.allocate(raw.length);
         b.copyPixelsToBuffer(back);
-        assertArrayEquals(new byte[] { 0x11, 0x22, 0x33, (byte) 0xff }, back.array());
+        assertArrayEquals(raw, back.array());
+
+        int[] ints = new int[4];
+        b.copyPixelsToBuffer(java.nio.IntBuffer.wrap(ints));
+        Bitmap b2 = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888);
+        b2.copyPixelsFromBuffer(java.nio.IntBuffer.wrap(ints));
+        ByteBuffer back2 = ByteBuffer.allocate(raw.length);
+        b2.copyPixelsToBuffer(back2);
+        assertArrayEquals(raw, back2.array());
     }
 
     @Test void wrapsAndDrawsText() {

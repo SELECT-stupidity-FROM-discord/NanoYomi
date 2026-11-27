@@ -112,7 +112,7 @@ impl Migrate {
                 this.store.update(cx, |store, cx| {
                     store.update(&source.id, &source.name, &manga, cx, |s| {
                         s.manga = manga.clone();
-                        s.chapters = chapters;
+                        s.chapters = std::sync::Arc::new(chapters);
                         s.in_library = from.in_library || s.in_library;
                         s.added_at = from.added_at;
                         if progress.is_some() {

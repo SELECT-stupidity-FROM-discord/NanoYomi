@@ -261,6 +261,8 @@ pub enum State {
 pub struct Downloads {
     pub queue: VecDeque<Job>,
     pub states: HashMap<String, State>,
+    pub completed_gen: u64,
+    pub last_completed: Option<(String, String, String)>,
     running: bool,
     /// Set when the running chapter is cancelled.
     cancelled: HashSet<String>,
@@ -271,7 +273,7 @@ impl Global for Shared {}
 
 pub fn init(cx: &mut App) {
     clear_scratch();
-    let entity = cx.new(|_| Downloads { queue: VecDeque::new(), states: HashMap::new(), running: false, cancelled: HashSet::new() });
+    let entity = cx.new(|_| Downloads { queue: VecDeque::new(), states: HashMap::new(), completed_gen: 0, last_completed: None, running: false, cancelled: HashSet::new() });
     cx.set_global(Shared(entity));
 }
 
@@ -280,6 +282,9 @@ pub fn get(cx: &App) -> Entity<Downloads> {
 }
 
 impl Downloads {
+    pub fn touches_series(&self, source_id: &str, title: &str) -> bool {
+        self.queue.iter().any(|j| j.source.id == source_id && j.title == title)
+    }
     pub fn enqueue(&mut self, jobs: Vec<Job>, cx: &mut Context<Self>) {
         for job in jobs {
             let url = job.url();
@@ -344,6 +349,8 @@ impl Downloads {
                     Ok(()) => {
                         this.queue.retain(|j| j.url() != url);
                         this.states.remove(&url);
+                        this.completed_gen += 1;
+                        this.last_completed = Some((job.source.id.clone(), job.title.clone(), chapter_name(&job.chapter)));
                     }
                     Err(_) if cancelled => {
                         this.queue.retain(|j| j.url() != url);

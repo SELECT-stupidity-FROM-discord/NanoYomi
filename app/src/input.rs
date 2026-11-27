@@ -4,7 +4,7 @@
 use crate::u;
 use crate::{FAINT, LINE, TEXT, ACCENT};
 use gpui::{
-    Animation, AnimationExt, ClickEvent, Context, EventEmitter, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    ClickEvent, Context, EventEmitter, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     Hsla, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ShapedLine, SharedString, StatefulInteractiveElement, Styled, TextRun, Window, canvas, div, rgb,
 };
 use std::{cell::RefCell, rc::Rc, time::Duration};
@@ -25,7 +25,9 @@ pub struct TextInput {
     back: usize,
     anchor: Option<usize>,
     dragging: bool,
-    pulse: usize,
+    blink_on: bool,
+    blink_gen: u64,
+    blink_task: Option<gpui::Task<()>>,
     shaped: Rc<RefCell<Option<(Pixels, ShapedLine)>>>,
 }
 
@@ -44,13 +46,41 @@ impl TextInput {
             back: 0,
             anchor: None,
             dragging: false,
-            pulse: 0,
+            blink_on: true,
+            blink_gen: 0,
+            blink_task: None,
             shaped: Rc::default(),
         }
     }
 
-    pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus.focus(window, cx);
+        self.reset_blink(cx);
+    }
+
+    /// Drives the 2 Hz cursor blink with a timer instead of a per-frame display animation.
+    fn reset_blink(&mut self, cx: &mut Context<Self>) {
+        self.blink_on = true;
+        self.blink_gen = self.blink_gen.wrapping_add(1);
+        let stamp = self.blink_gen;
+        self.blink_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(500)).await;
+                let keep = this
+                    .update(cx, |this, cx| {
+                        if this.blink_gen != stamp {
+                            return false;
+                        }
+                        this.blink_on = !this.blink_on;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        }));
     }
 
     fn byte_at(&self, back: usize) -> usize {
@@ -107,7 +137,7 @@ impl TextInput {
             };
             if let Some(back) = collapsed {
                 (self.back, self.anchor) = (back, None);
-                self.pulse += 1;
+                self.reset_blink(cx);
                 cx.stop_propagation();
                 cx.notify();
                 return;
@@ -165,7 +195,7 @@ impl TextInput {
         if !keep_selection {
             self.anchor = None;
         }
-        self.pulse += 1;
+        self.reset_blink(cx);
         cx.stop_propagation();
         cx.notify();
     }
@@ -174,6 +204,13 @@ impl TextInput {
 impl Render for TextInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus.is_focused(window);
+        if focused && self.blink_task.is_none() {
+            self.reset_blink(cx);
+        } else if !focused && self.blink_task.is_some() {
+            self.blink_task = None;
+            self.blink_on = true;
+            self.blink_gen = self.blink_gen.wrapping_add(1);
+        }
         let selection = self.selection();
         let (from, to) = selection.unwrap_or((self.caret(), self.caret()));
         let shown = self.shown();
@@ -188,7 +225,7 @@ impl Render for TextInput {
             .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
                 this.back = this.back_at(ev.position.x);
                 (this.anchor, this.dragging) = (Some(this.back), true);
-                this.pulse += 1;
+                this.reset_blink(cx);
                 cx.notify();
             }))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
@@ -224,9 +261,9 @@ impl Render for TextInput {
             .cursor_text()
             .children(self.icon.then(crate::search_icon))
             .child({
-                let pulse = self.pulse;
+                let blink_on = self.blink_on;
                 let caret = move || {
-                    div().flex_none().w(u(2.)).h(u(18.)).bg(rgb(ACCENT)).with_animation(("caret", pulse), Animation::new(Duration::from_millis(1000)).repeat(), |d, t| d.opacity(if t < 0.5 { 1. } else { 0. }))
+                    div().flex_none().w(u(2.)).h(u(18.)).bg(rgb(ACCENT)).opacity(if blink_on { 1. } else { 0. })
                 };
                 let empty = self.text.is_empty();
                 let highlight: Hsla = rgb(ACCENT).into();

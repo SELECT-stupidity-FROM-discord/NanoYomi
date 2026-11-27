@@ -53,11 +53,34 @@ impl Registry {
         };
         cx.spawn(async move |this, cx| {
             let (host, dir) = this.read_with(cx, |r, _| (r.host.clone(), r.data_dir.clone())).ok()?;
-            let jars = { let dir = dir.clone(); cx.background_executor().spawn(async move { extensions::installed(&dir) }).await };
-            for (pkg, jar) in jars {
-                load(&this, &host, cx, pkg, jar).await;
-            }
+            let prepared: Vec<(String, PathBuf, String, String)> = cx
+                .background_executor()
+                .spawn(async move {
+                    extensions::installed(&dir)
+                        .into_iter()
+                        .map(|(pkg, jar)| {
+                            let key = extensions::key_for(&jar);
+                            let version = extensions::version_of(&jar);
+                            (pkg, jar, key, version)
+                        })
+                        .collect()
+                })
+                .await;
+            let loaded = futures::future::join_all(prepared.into_iter().map(|(pkg, jar, key, version)| {
+                let host = host.clone();
+                let cx = cx.clone();
+                async move {
+                    let mut cx = cx;
+                    let result = call(&host, &mut cx, "load", json!({ "jar": jar, "signingKey": key })).await;
+                    (pkg, version, result)
+                }
+            }))
+            .await;
             this.update(cx, |r, cx| {
+                for (pkg, version, result) in loaded {
+                    apply_loaded(r, pkg, version, result);
+                }
+                r.sources.sort_by_cached_key(|s| s.name.to_lowercase());
                 r.ready = true;
                 if r.status.starts_with("Loading") {
                     r.status = "".into();
@@ -185,34 +208,38 @@ impl Registry {
     }
 }
 
+fn apply_loaded(r: &mut Registry, pkg: String, version: String, result: Result<serde_json::Value, String>) {
+    r.installed.insert(pkg.clone());
+    r.versions.insert(pkg.clone(), version);
+    match result {
+        Ok(list) => {
+            r.errors.remove(&pkg);
+            r.sources.retain(|s| s.pkg != pkg);
+            r.sources.extend(list.as_array().into_iter().flatten().filter_map(|s| {
+                Some(SourceInfo {
+                    id: s["id"].as_str()?.to_string(),
+                    name: s["name"].as_str()?.to_string(),
+                    lang: s["lang"].as_str().unwrap_or("").to_string(),
+                    pkg: pkg.clone(),
+                    supports_latest: s["supportsLatest"].as_bool().unwrap_or(true),
+                    base_url: s["baseUrl"].as_str().unwrap_or("").to_string(),
+                })
+            }));
+        }
+        Err(e) => {
+            eprintln!("{pkg}: {e}");
+            r.errors.insert(pkg, e);
+        }
+    }
+}
+
 async fn load(this: &WeakEntity<Registry>, host: &Arc<Host>, cx: &mut AsyncApp, pkg: String, jar: PathBuf) {
     let key = extensions::key_for(&jar);
     let version = extensions::version_of(&jar);
     let result = call(host, cx, "load", json!({ "jar": jar, "signingKey": key })).await;
     let _ = this.update(cx, |r, cx| {
-        r.installed.insert(pkg.clone());
-        r.versions.insert(pkg.clone(), version);
-        match result {
-            Ok(list) => {
-                r.errors.remove(&pkg);
-                r.sources.retain(|s| s.pkg != pkg);
-                r.sources.extend(list.as_array().into_iter().flatten().filter_map(|s| {
-                    Some(SourceInfo {
-                        id: s["id"].as_str()?.to_string(),
-                        name: s["name"].as_str()?.to_string(),
-                        lang: s["lang"].as_str().unwrap_or("").to_string(),
-                        pkg: pkg.clone(),
-                        supports_latest: s["supportsLatest"].as_bool().unwrap_or(true),
-                        base_url: s["baseUrl"].as_str().unwrap_or("").to_string(),
-                    })
-                }));
-                r.sources.sort_by_key(|s| s.name.to_lowercase());
-            }
-            Err(e) => {
-                eprintln!("{pkg}: {e}");
-                r.errors.insert(pkg.clone(), e);
-            }
-        }
+        apply_loaded(r, pkg, version, result);
+        r.sources.sort_by_cached_key(|s| s.name.to_lowercase());
         cx.notify();
     });
 }
