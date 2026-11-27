@@ -687,7 +687,7 @@ impl Library {
 }
 
 /// "SUN 16 NOV" for a date in milliseconds.
-fn day_label(ms: i64) -> String {
+pub(crate) fn day_label(ms: i64) -> String {
     const DAYS: [&str; 7] = ["THU", "FRI", "SAT", "SUN", "MON", "TUE", "WED"];
     const MONTHS: [&str; 12] = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
     let ymd = crate::manga::ymd(ms);
@@ -696,7 +696,7 @@ fn day_label(ms: i64) -> String {
 }
 
 /// A cover with a READING or CAUGHT UP label and a thin progress line along the bottom.
-fn card_cover(cover: AnyElement, read: Option<f32>, caught_up: bool) -> impl IntoElement {
+pub(crate) fn card_cover(cover: AnyElement, read: Option<f32>, caught_up: bool) -> impl IntoElement {
     div().relative().child(cover).when_some(read, |d, f| {
         let label = if caught_up { "CAUGHT UP" } else { "READING" };
         d.when(caught_up, |d| d.child(div().absolute().inset_0().rounded(u(4.)).bg(gpui::rgba(0x0D0C0B99))))

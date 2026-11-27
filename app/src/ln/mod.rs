@@ -2,10 +2,12 @@
 //! Nothing here reads or writes manga data. Switching modes swaps the whole window content.
 
 mod browse;
+mod browser;
 mod catalog;
 pub mod js;
 mod library;
 mod novel;
+mod palette;
 pub mod plugins;
 mod reader;
 mod settings;
@@ -14,11 +16,11 @@ pub mod text;
 
 use crate::covers::{CARD_H, CARD_W, Covers, Fetch, cover};
 use crate::images::ImageCache;
-use crate::sidebar::{NARROW, Tip, WIDE, item, ja, label};
+use crate::sidebar::{Dragged, NARROW, Tip, WIDE, item, ja, label};
 use crate::store::Store;
 use crate::{ACCENT, ACCENT_TEXT, CJK, FAINT, HOVER, LINE, MUTED, RULE, TEXT, u};
 use gpui::{
-    AnyElement, AppContext, Context, Entity, EventEmitter, FocusHandle, FontWeight, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    Animation, AnimationExt, AnyElement, AppContext, Context, Entity, EventEmitter, FocusHandle, FontWeight, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, StyledImage, Subscription, Window, div, prelude::FluentBuilder, rgb,
 };
 use plugins::Plugins;
@@ -71,6 +73,10 @@ pub(crate) async fn guarded<T, Fut: std::future::Future<Output = Result<T, Strin
     if !solved.await.unwrap_or(false) {
         return Err("Verification was cancelled".into());
     }
+    let third = call().await;
+    // The check passed in a web view but plain HTTP is still turned away, so use the web view for this site.
+    let Some(again) = third.as_ref().err().and_then(|e| js::challenge_url(e)).map(str::to_string) else { return third };
+    browser::route(&again);
     call().await.map_err(|e| if js::challenge_url(&e).is_some() { "The site still wants a check. Try again in a moment.".to_string() } else { e })
 }
 
@@ -128,8 +134,18 @@ pub struct LnApp {
     catalog: Option<Entity<catalog::Catalog>>,
     settings: Option<Entity<settings::Settings>>,
     novel: Option<(Entity<novel::NovelView>, Subscription)>,
+    /// The panel that's sliding shut, kept until it's out of sight.
+    closing: Option<Entity<novel::NovelView>>,
+    /// Bumped each time the panel opens or closes so its slide starts over.
+    panel_moves: usize,
     reader: Option<(Entity<reader::LnReader>, Subscription)>,
     icons: Covers,
+    /// Bumped when the sidebar opens or closes, so its slide starts over.
+    sidebar_moves: usize,
+    was_narrow: Option<bool>,
+    palette: Option<palette::LnPalette>,
+    /// Hidden web views that make requests for sites that won't answer plain HTTP.
+    browsers: browser::Views,
     focus: FocusHandle,
     _subs: Vec<Subscription>,
 }
@@ -146,22 +162,63 @@ impl LnApp {
         let repos = store.read(cx).prefs().repos.clone();
         plugins.update(cx, |p, cx| p.refresh_index(repos, cx));
         let library = cx.new(|cx| library::Library::new(store.clone(), plugins.clone(), cache.clone(), cx));
-        let browse = cx.new(|cx| browse::Browse::new(store.clone(), plugins.clone(), cache.clone(), cx));
+        let browse = cx.new(|cx| browse::Browse::new(plugins.clone(), cache.clone(), cx));
         let focus = cx.focus_handle();
         focus.focus(window, cx);
+        let mut jobs = browser::queue();
+        cx.spawn_in(window, async move |this, cx| {
+            use futures::StreamExt;
+            while let Some(job) = jobs.next().await {
+                let Ok(ready) = this.update_in(cx, |this, window, _| this.browsers.ensure(&job.origin, window)) else { break };
+                let Some(ready) = ready else {
+                    browser::fail(job.id, "The system web view won't start");
+                    continue;
+                };
+                let mut waited = 0;
+                while !ready.load(std::sync::atomic::Ordering::Relaxed) && waited < 300 {
+                    cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                    waited += 1;
+                }
+                if !ready.load(std::sync::atomic::Ordering::Relaxed) {
+                    browser::fail(job.id, "The site's page didn't load");
+                    continue;
+                }
+                let _ = this.update(cx, |this, _| this.browsers.run(&job.origin, &job.script));
+            }
+        })
+        .detach();
         let subs = vec![
             cx.subscribe_in(&library, window, |this, _, ev: &OpenNovel, window, cx| this.open_novel(&ev.source, &ev.path, window, cx)),
             cx.subscribe_in(&library, window, |this, _, ev: &ReadChapter, window, cx| this.read_stored(ev, window, cx)),
+            cx.subscribe_in(&library, window, |this, _, _: &library::GoBrowse, _, cx| this.go(Screen::Browse, cx)),
             cx.subscribe_in(&browse, window, |this, _, ev: &OpenNovel, window, cx| this.open_novel(&ev.source, &ev.path, window, cx)),
             cx.observe(&plugins, |_, _, cx| cx.notify()),
             cx.observe(&main, |_, _, cx| cx.notify()),
         ];
-        LnApp { store, plugins, main, cache, screen: Screen::Library, library, browse, catalog: None, settings: None, novel: None, reader: None, icons: Covers::default(), focus, _subs: subs }
+        LnApp { store, plugins, main, cache, screen: Screen::Library, library, browse, catalog: None, settings: None, novel: None, closing: None, panel_moves: 0, reader: None, icons: Covers::default(), browsers: Default::default(), sidebar_moves: 0, was_narrow: None, palette: None, focus, _subs: subs }
+    }
+
+    fn close_novel(&mut self, cx: &mut Context<Self>) {
+        let Some((view, _)) = self.novel.take() else { return };
+        self.closing = Some(view);
+        self.panel_moves += 1;
+        let moves = self.panel_moves;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(crate::SLIDE).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.panel_moves == moves {
+                    this.closing = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn go(&mut self, screen: Screen, cx: &mut Context<Self>) {
         self.screen = screen;
-        self.novel = None;
+        self.close_novel(cx);
         self.library.update(cx, |l, cx| l.show(screen == Screen::Updates, screen == Screen::History, cx));
         match screen {
             Screen::Browse => self.browse.update(cx, |b, cx| b.activate(cx)),
@@ -170,8 +227,8 @@ impl LnApp {
                 self.catalog = Some(cx.new(|cx| catalog::Catalog::new(plugins, store, cache, cx)));
             }
             Screen::Settings if self.settings.is_none() => {
-                let (plugins, store) = (self.plugins.clone(), self.store.clone());
-                self.settings = Some(cx.new(|cx| settings::Settings::new(plugins, store, cx)));
+                let store = self.store.clone();
+                self.settings = Some(cx.new(|cx| settings::Settings::new(store, cx)));
             }
             _ => {}
         }
@@ -182,15 +239,16 @@ impl LnApp {
         let (store, plugins, cache) = (self.store.clone(), self.plugins.clone(), self.cache.clone());
         let view = cx.new(|cx| novel::NovelView::new(source, path, store, plugins, cache, cx));
         let sub = cx.subscribe_in(&view, window, |this, view, ev: &novel::NovelEvent, window, cx| match ev {
-            novel::NovelEvent::Back => {
-                this.novel = None;
-                cx.notify();
-            }
+            novel::NovelEvent::Back => this.close_novel(cx),
             novel::NovelEvent::Read(index) => {
                 let n = view.read(cx).novel().clone();
                 this.open_reader(n, *index, window, cx);
             }
         });
+        if self.novel.is_none() {
+            self.panel_moves += 1;
+        }
+        self.closing = None;
         self.novel = Some((view, sub));
         cx.notify();
     }
@@ -216,14 +274,22 @@ impl LnApp {
 
     fn sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let narrow = self.main.read(cx).prefs().sidebar_collapsed;
-        crate::set_sidebar_width(if narrow { NARROW } else { WIDE });
-        let browsing = self.screen == Screen::Browse && self.novel.is_none();
+        // ⌘\ flips the same preference from the window, so the slide starts from whichever side changed it.
+        if self.was_narrow.is_some_and(|w| w != narrow) {
+            self.sidebar_moves += 1;
+        }
+        self.was_narrow = Some(narrow);
+        let browsing = self.screen == Screen::Browse;
         let current = self.browse.read(cx).source_id().map(str::to_string);
-        let installed = self.plugins.read(cx).installed.clone();
+        let order = self.store.read(cx).prefs().source_order.clone();
+        let mut installed = self.plugins.read(cx).installed.clone();
+        // Sources you haven't placed keep their order, after the ones you have.
+        installed.sort_by_key(|e| order.iter().position(|o| *o == e.id).unwrap_or(usize::MAX));
         let nav = |screen: Screen, jp: &'static str, en: &'static str, cx: &mut Context<Self>| {
-            let on = self.screen == screen && self.novel.is_none();
+            let on = self.screen == screen;
             item(en, ja(jp, on, narrow), en.into(), on, narrow).on_click(cx.listener(move |this, _, _, cx| this.go(screen, cx)))
         };
+        let ids: Vec<String> = installed.iter().map(|e| e.id.clone()).collect();
         let rows: Vec<_> = installed
             .iter()
             .map(|e| {
@@ -231,33 +297,90 @@ impl LnApp {
                 let initial = e.name.chars().next().unwrap_or('?').to_uppercase().to_string();
                 let url = Some(e.icon_url.as_str()).filter(|u| !u.is_empty());
                 let icon = self.icons.get(&self.cache, Some(Fetch::Icon), url, |a: &mut LnApp| &mut a.icons, cx);
-                let size = if narrow { 24. } else { 18. };
-                let badge = div()
-                    .flex_none()
-                    .size(u(size))
-                    .rounded(u(if narrow { 12. } else { 4. }))
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(rgb(if on { ACCENT } else { LINE }))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(u(11.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(if on { TEXT } else { MUTED }))
-                    .map(|d| match icon {
-                        Some(image) => d.child(gpui::img(image).size_full().object_fit(gpui::ObjectFit::Cover)),
-                        None if narrow => d.child(initial),
-                        None => d,
-                    })
-                    .into_any_element();
+                let short = match (narrow, icon) {
+                    (true, icon) => div()
+                        .flex_none()
+                        .size(u(24.))
+                        .rounded(u(12.))
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(rgb(if on { ACCENT } else { LINE }))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(u(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(if on { TEXT } else { MUTED }))
+                        .map(|d| match icon {
+                            Some(image) => d.child(gpui::img(image).size_full().object_fit(gpui::ObjectFit::Cover)),
+                            None => d.child(initial),
+                        })
+                        .into_any_element(),
+                    (false, Some(image)) => div()
+                        .flex_none()
+                        .size(u(18.))
+                        .rounded(u(4.))
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(rgb(if on { ACCENT } else { LINE }))
+                        .child(gpui::img(image).size_full().object_fit(gpui::ObjectFit::Cover))
+                        .into_any_element(),
+                    (false, None) => div().flex_none().size(u(6.)).rounded(u(3.)).bg(rgb(if on { ACCENT } else { LINE })).into_any_element(),
+                };
+                let lang = e.lang.trim_matches('\u{200e}');
+                let name: SharedString = if lang.is_empty() || lang == "English" || lang == "all" { e.name.clone() } else { format!("{} · {lang}", e.name) }.into();
                 let id = e.id.clone();
-                item(SharedString::from(format!("side-{}", e.id)), badge, e.name.clone().into(), on, narrow).on_click(cx.listener(move |this, _, _, cx| {
-                    this.go(Screen::Browse, cx);
-                    this.browse.update(cx, |b, cx| b.select(&id, cx));
-                }))
+                let (grab, target, line, here, all) = (e.id.clone(), e.id.clone(), ids.clone(), e.id.clone(), ids.clone());
+                item(SharedString::from(format!("side-{}", e.id)), short, name.clone(), on, narrow)
+                    .group("source-row")
+                    .when(!narrow, |d| d.child(crate::sidebar::grip()))
+                    .on_drag(Dragged(grab), move |_, _, _, cx| cx.new(|_| Tip(name.clone())))
+                    .drag_over::<Dragged>(move |d, from, _, _| {
+                        let at = |id: &str| line.iter().position(|i| i == id);
+                        if from.0 == here {
+                            d
+                        } else if at(&from.0) < at(&here) {
+                            d.border_b_2().border_color(rgb(ACCENT))
+                        } else {
+                            d.border_t_2().border_color(rgb(ACCENT))
+                        }
+                    })
+                    .on_drop(cx.listener(move |this, from: &Dragged, _, cx| {
+                        let mut ids = all.clone();
+                        let (Some(a), Some(b)) = (ids.iter().position(|i| *i == from.0), ids.iter().position(|i| *i == target)) else { return };
+                        let moved = ids.remove(a);
+                        ids.insert(b, moved);
+                        this.store.update(cx, |s, cx| s.edit_prefs(cx, |p| p.source_order = ids));
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.go(Screen::Browse, cx);
+                        this.browse.update(cx, |b, cx| b.select(&id, cx));
+                    }))
             })
             .collect();
+        let search = div()
+            .id("ln-side-search")
+            .flex_none()
+            .h(u(34.))
+            .px(u(10.))
+            .rounded(u(8.))
+            .border_1()
+            .border_color(rgb(LINE))
+            .bg(rgb(crate::SURFACE))
+            .flex()
+            .items_center()
+            .gap(u(8.))
+            .when(narrow, |d| d.justify_center().px_0())
+            .text_color(rgb(MUTED))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(HOVER)))
+            .child(crate::search_icon())
+            .when(!narrow, |d| {
+                d.child(div().flex_1().child("Search")).child(
+                    div().font_family(crate::fonts::mono()).text_size(u(11.)).text_color(rgb(FAINT)).px(u(5.)).border_1().border_color(rgb(LINE)).rounded(u(4.)).child(if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl K" }),
+                )
+            })
+            .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx)));
         let brand = div()
             .flex()
             .items_center()
@@ -284,7 +407,10 @@ impl LnApp {
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(HOVER)))
                     .child(gpui::svg().path("icons/sidebar.svg").size(u(16.)).text_color(rgb(FAINT)))
-                    .tooltip(move |_, cx| cx.new(|_| Tip(format!("{} sidebar", if narrow { "Expand" } else { "Collapse" }).into())).into())
+                    .tooltip(move |_, cx| {
+                        let key = if cfg!(target_os = "macos") { "⌘\\" } else { "Ctrl \\" };
+                        cx.new(|_| Tip(format!("{} sidebar ({key})", if narrow { "Expand" } else { "Collapse" }).into())).into()
+                    })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.main.update(cx, |s, cx| {
                             let on = !s.prefs().sidebar_collapsed;
@@ -292,11 +418,13 @@ impl LnApp {
                         });
                     })),
             );
+        let (from, to) = if narrow { (WIDE, NARROW) } else { (NARROW, WIDE) };
+        // The first frame starts settled, so launching doesn't play the slide.
+        let from = if self.sidebar_moves == 0 { to } else { from };
         div()
             .flex_none()
             .overflow_hidden()
             .h_full()
-            .w(u(if narrow { NARROW } else { WIDE }))
             .bg(rgb(0x11100E))
             .border_r_1()
             .border_color(rgb(RULE))
@@ -307,6 +435,7 @@ impl LnApp {
             .pt(u(18.))
             .pb(u(14.))
             .child(brand)
+            .child(search)
             .child(
                 div()
                     .flex()
@@ -338,6 +467,11 @@ impl LnApp {
                     .child(nav(Screen::Settings, "設定", "Settings", cx))
                     .child(item("ln-mode", ja("切替", false, narrow), "Switch to Manga".into(), false, narrow).on_click(cx.listener(|_, _, _, cx| cx.emit(SwitchMode)))),
             )
+            .with_animation(("ln-sidebar", self.sidebar_moves), Animation::new(crate::SLIDE).with_easing(gpui::ease_out_quint()), move |d, t| {
+                let w = from + (to - from) * t;
+                crate::set_sidebar_width(w);
+                d.w(u(w))
+            })
     }
 }
 
@@ -346,15 +480,38 @@ impl Render for LnApp {
         if let Some((reader, _)) = &self.reader {
             return div().size_full().child(reader.clone()).into_any_element();
         }
-        let screen: AnyElement = match (&self.novel, self.screen) {
-            (Some((novel, _)), _) => novel.clone().into_any_element(),
-            (_, Screen::Library | Screen::Updates | Screen::History) => self.library.clone().into_any_element(),
-            (_, Screen::Browse) => self.browse.clone().into_any_element(),
-            (_, Screen::Extensions) => self.catalog.clone().map(IntoElement::into_any_element).unwrap_or_else(|| div().into_any_element()),
-            (_, Screen::Settings) => self.settings.clone().map(IntoElement::into_any_element).unwrap_or_else(|| div().into_any_element()),
+        let screen: AnyElement = match self.screen {
+            Screen::Library | Screen::Updates | Screen::History => self.library.clone().into_any_element(),
+            Screen::Browse => self.browse.clone().into_any_element(),
+            Screen::Extensions => self.catalog.clone().map(IntoElement::into_any_element).unwrap_or_else(|| div().into_any_element()),
+            Screen::Settings => self.settings.clone().map(IntoElement::into_any_element).unwrap_or_else(|| div().into_any_element()),
         };
+        // The novel slides open beside the grid, so you keep your place in it.
+        let open = self.novel.is_some();
+        let panel = self.novel.as_ref().map(|(v, _)| v.clone()).or_else(|| self.closing.clone()).map(|view| {
+            let (from, to) = if open { (0., crate::manga::PANEL) } else { (crate::manga::PANEL, 0.) };
+            div()
+                .flex_none()
+                .relative()
+                .h_full()
+                .overflow_hidden()
+                .border_l_1()
+                .border_color(rgb(RULE))
+                .bg(rgb(0x11100E))
+                // A fixed width pinned to the right, so it slides in whole instead of rewrapping.
+                .child(div().absolute().top_0().bottom_0().right_0().w(u(crate::manga::PANEL)).child(view))
+                .with_animation(("ln-panel", self.panel_moves), Animation::new(crate::SLIDE).with_easing(gpui::ease_out_quint()), move |d, t| {
+                    let w = from + (to - from) * t;
+                    crate::set_panel_width(w);
+                    d.w(u(w))
+                })
+        });
+        if panel.is_none() {
+            crate::set_panel_width(0.);
+        }
         div()
             .size_full()
+            .relative()
             .flex()
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &crate::ShowLibrary, _, cx| this.go(Screen::Library, cx)))
@@ -362,13 +519,16 @@ impl Render for LnApp {
             .on_action(cx.listener(|this, _: &crate::ShowExtensions, _, cx| this.go(Screen::Extensions, cx)))
             .on_action(cx.listener(|this, _: &crate::ShowHistory, _, cx| this.go(Screen::History, cx)))
             .on_action(cx.listener(|this, _: &crate::ShowSettings, _, cx| this.go(Screen::Settings, cx)))
+            .on_action(cx.listener(|this, _: &crate::Search, window, cx| this.open_palette(window, cx)))
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
-                if ev.keystroke.key == "escape" && this.novel.take().is_some() {
-                    cx.notify();
+                if ev.keystroke.key == "escape" {
+                    this.close_novel(cx);
                 }
             }))
             .child(self.sidebar(cx))
             .child(div().flex_1().min_w_0().h_full().child(screen))
+            .children(panel)
+            .children(self.palette(cx))
             .into_any_element()
     }
 }

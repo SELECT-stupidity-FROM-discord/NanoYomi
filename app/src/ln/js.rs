@@ -31,7 +31,7 @@ struct Clearance {
 static JAR: LazyLock<Mutex<HashMap<String, Clearance>>> = LazyLock::new(Mutex::default);
 
 /// The site a cookie covers: the last two labels of the host, so `www.` and `api.` share it.
-fn site_key(url: &str) -> String {
+pub(super) fn site_key(url: &str) -> String {
     let host = url.split("//").nth(1).unwrap_or(url).split(['/', '?', '#']).next().unwrap_or("");
     let host = host.rsplit('@').next().unwrap_or("").split(':').next().unwrap_or("").to_ascii_lowercase();
     let labels: Vec<&str> = host.split('.').collect();
@@ -40,7 +40,11 @@ fn site_key(url: &str) -> String {
 
 /// Remembers the cookies and agent a web view passed a check with, for this site's later requests.
 pub fn keep_clearance(url: &str, set_cookies: Vec<String>, user_agent: &str) {
-    let cookies = set_cookies.iter().filter_map(|c| c.split(';').next()).map(|c| c.trim().to_string()).filter(|c| c.contains('=')).collect();
+    let cookies: Vec<String> = set_cookies.iter().filter_map(|c| c.split(';').next()).map(|c| c.trim().to_string()).filter(|c| c.contains('=')).collect();
+    if debug() {
+        let names: Vec<&str> = cookies.iter().filter_map(|c: &String| c.split('=').next()).collect();
+        eprintln!("ln clearance for {} from {url}: cookies {names:?} agent {user_agent:?}", site_key(url));
+    }
     JAR.lock().unwrap().insert(site_key(url), Clearance { cookies, user_agent: user_agent.to_string() });
 }
 
@@ -252,25 +256,36 @@ fn fetch(agent: &ureq::Agent, req: &str, challenge: &Mutex<Option<String>>) -> S
                 builder = builder.header(k.as_str(), v.as_str());
             }
         }
-        let body = req["body"].as_str().unwrap_or_default().as_bytes().to_vec();
-        let request = builder.body(body).map_err(|e| e.to_string())?;
+        let (status, status_text, final_url, headers, bytes): (u16, String, String, Vec<(String, String)>, Vec<u8>) = if super::browser::routed(url) {
+            if debug() {
+                eprintln!("ln fetch {method} {url} through the browser");
+            }
+            let r = super::browser::fetch(&req)?;
+            let pairs = r["headers"].as_array().into_iter().flatten().filter_map(|h| Some((h[0].as_str()?.to_string(), h[1].as_str()?.to_string()))).collect();
+            (r["status"].as_u64().unwrap_or(0) as u16, r["statusText"].as_str().unwrap_or("").into(), r["url"].as_str().unwrap_or(url).into(), pairs, r["body"].as_str().unwrap_or("").as_bytes().to_vec())
+        } else {
+            let body = req["body"].as_str().unwrap_or_default().as_bytes().to_vec();
+            let request = builder.body(body).map_err(|e| e.to_string())?;
+            if debug() {
+                let names: Vec<&str> = headers.get("cookie").map(|c| c.split("; ").filter_map(|p| p.split('=').next()).collect()).unwrap_or_default();
+                eprintln!("ln fetch {method} {url} cookies {names:?} agent {:?}", headers.get("user-agent"));
+            }
+            let mut res = agent.run(request).map_err(|e| format!("{url}: {e}"))?;
+            let status = res.status();
+            let pairs = res.headers().iter().map(|(k, v)| (k.to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned())).collect();
+            let final_url = ureq::ResponseExt::get_uri(&res).to_string();
+            let bytes = res.body_mut().with_config().limit(32 << 20).read_to_vec().map_err(|e| format!("{url}: {e}"))?;
+            (status.as_u16(), status.canonical_reason().unwrap_or("").into(), final_url, pairs, bytes)
+        };
         if debug() {
-            eprintln!("ln fetch {method} {url}");
+            eprintln!("ln fetch {status} {} bytes, cf-mitigated {:?}", bytes.len(), headers.iter().find(|(k, _)| k == "cf-mitigated").map(|(_, v)| v));
         }
-        let mut res = agent.run(request).map_err(|e| format!("{url}: {e}"))?;
-        let status = res.status();
-        let headers: Vec<(String, String)> = res.headers().iter().map(|(k, v)| (k.to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned())).collect();
-        let final_url = ureq::ResponseExt::get_uri(&res).to_string();
-        let bytes = res.body_mut().with_config().limit(32 << 20).read_to_vec().map_err(|e| format!("{url}: {e}"))?;
-        if debug() {
-            eprintln!("ln fetch {status} {} bytes", bytes.len());
-        }
-        if is_challenge(status.as_u16(), &headers, &bytes) {
+        if is_challenge(status, &headers, &bytes) {
             *challenge.lock().unwrap() = Some(url.to_string());
         }
         Ok(serde_json::json!({
-            "status": status.as_u16(),
-            "statusText": status.canonical_reason().unwrap_or(""),
+            "status": status,
+            "statusText": status_text,
             "url": final_url,
             "headers": headers,
             "body": String::from_utf8_lossy(&bytes),

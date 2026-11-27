@@ -95,6 +95,10 @@ fn set_sidebar_width(w: f32) {
 /// The series panel's width right now, which changes while it slides.
 static PANEL: AtomicU32 = AtomicU32::new(0);
 
+pub fn set_panel_width(w: f32) {
+    PANEL.store(w.to_bits(), Ordering::Relaxed);
+}
+
 /// The window's width minus the sidebar and the series panel, as they are this frame, for sizing grids.
 pub fn content_width(window: &Window) -> f32 {
     let taken = f32::from_bits(SIDEBAR.load(Ordering::Relaxed)) + f32::from_bits(PANEL.load(Ordering::Relaxed));

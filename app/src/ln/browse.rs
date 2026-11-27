@@ -1,9 +1,8 @@
 //! One source's popular, latest or search results as a cover grid that loads more as you scroll.
 
 use super::plugins::{Item, Plugins, Source};
-use super::store::LnStore;
 use super::{GAP, OpenNovel, PAD, card, cover_fetch, notice};
-use crate::catalog::small_button;
+use crate::browse::segment;
 use crate::covers::{CARD_W, Covers, grid};
 use crate::images::ImageCache;
 use crate::input::{InputEvent, TextInput};
@@ -23,7 +22,6 @@ enum Listing {
 }
 
 pub struct Browse {
-    store: Entity<LnStore>,
     plugins: Entity<Plugins>,
     cache: Entity<ImageCache>,
     covers: Covers,
@@ -49,7 +47,7 @@ pub struct Browse {
 impl EventEmitter<OpenNovel> for Browse {}
 
 impl Browse {
-    pub fn new(store: Entity<LnStore>, plugins: Entity<Plugins>, cache: Entity<ImageCache>, cx: &mut Context<Self>) -> Self {
+    pub fn new(plugins: Entity<Plugins>, cache: Entity<ImageCache>, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| TextInput::new("Search this source…", cx));
         let subs = vec![
             cx.subscribe(&search, |this, input, _: &InputEvent, cx| {
@@ -60,7 +58,6 @@ impl Browse {
             cx.observe(&plugins, |this, _, cx| this.check_source(cx)),
         ];
         let mut this = Browse {
-            store,
             plugins,
             cache,
             covers: Covers::default(),
@@ -109,6 +106,10 @@ impl Browse {
     }
 
     /// Called when the screen is shown, which is when the first page loads.
+    pub fn search(&self) -> Entity<TextInput> {
+        self.search.clone()
+    }
+
     pub fn activate(&mut self, cx: &mut Context<Self>) {
         self.active = true;
         if self.source.is_some() && self.items.is_empty() && self.page == 0 {
@@ -182,9 +183,7 @@ impl Browse {
         let item = self.items[i].clone();
         let how = cover_fetch(self.plugins.read(cx), &source.id);
         let image = self.covers.get(&self.cache, how, Some(item.cover.as_str()).filter(|c| !c.is_empty()), |b: &mut Browse| &mut b.covers, cx);
-        let in_library = self.store.read(cx).get(&source.id, &item.path).is_some_and(|n| n.in_library);
-        let lines = if in_library { vec!["In library".to_string()] } else { vec![] };
-        card(("ln-browse", i), image, &item.name, self.card_w, 0, lines)
+        card(("ln-browse", i), image, &item.name, self.card_w, 0, vec![])
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let (Some(s), Some(item)) = (this.source.as_ref(), this.items.get(i)) {
                     cx.emit(OpenNovel { source: s.id.clone(), path: item.path.clone() });
@@ -212,7 +211,7 @@ impl Render for Browse {
         let broken = self.failed && self.items.is_empty();
         let empty = self.source.is_some() && !self.loading && !self.failed && self.page > 0 && self.items.is_empty();
         let retry = |cx: &mut Context<Self>| {
-            small_button("ln-retry", "Try again", true).on_click(cx.listener(|this, _, _, cx| {
+            segment("ln-retry", "Try again", false).border_1().border_color(rgb(crate::LINE)).on_click(cx.listener(|this, _, _, cx| {
                 this.failed = false;
                 this.load_next_page(cx);
             }))
@@ -237,7 +236,7 @@ impl Render for Browse {
                     }))))
                     .child(div().w(u(300.)).max_w_full().child(self.search.clone())),
             )
-            .when(self.failed && !broken, |d| d.child(div().px(u(PAD)).pt(u(16.)).flex().items_center().gap_3().child(div().text_color(rgb(ACCENT_TEXT)).child(self.status.clone())).child(retry(cx))))
+            .when(self.failed && !broken, |d| d.child(div().px(u(PAD)).pt(u(16.)).flex().items_center().gap_3().child(div().min_w_0().text_size(u(14.)).text_color(rgb(ACCENT_TEXT)).child(self.status.clone())).child(retry(cx))))
             .child(if broken {
                 div()
                     .flex_1()
@@ -248,7 +247,7 @@ impl Render for Browse {
                     .gap_2()
                     .pb(u(80.))
                     .child(div().text_size(u(48.)).text_color(rgb(crate::MUTED)).child("( x_x )"))
-                    .child(div().text_size(u(18.)).child("The shelf won't open"))
+                    .child(div().text_size(u(18.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(rgb(crate::TEXT)).child("The shelf won't open"))
                     .child(div().max_w(u(560.)).text_color(rgb(ACCENT_TEXT)).child(self.status.clone()))
                     .child(div().pt(u(12.)).child(retry(cx)))
                     .into_any_element()

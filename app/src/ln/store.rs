@@ -83,13 +83,13 @@ pub struct Prefs {
     pub width: f32,
     pub oldest_first: bool,
     pub repos: Vec<String>,
-    /// The language the Extensions screen lists.
-    pub language: String,
+    /// Source ids in the order the sidebar shows them.
+    pub source_order: Vec<String>,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { font_size: 19., line_height: 1.7, width: 720., oldest_first: false, repos: vec![super::plugins::DEFAULT_REPO.into()], language: "English".into() }
+        Prefs { font_size: 19., line_height: 1.7, width: 720., oldest_first: false, repos: vec![super::plugins::DEFAULT_REPO.into()], source_order: vec![] }
     }
 }
 

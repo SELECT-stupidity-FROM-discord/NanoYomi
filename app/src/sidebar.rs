@@ -9,7 +9,7 @@ pub const NARROW: f32 = 64.;
 
 pub(crate) struct Tip(pub SharedString);
 
-struct Dragged(String);
+pub(crate) struct Dragged(pub String);
 
 impl Render for Tip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -39,7 +39,7 @@ pub(crate) fn item(id: impl Into<gpui::ElementId>, short: AnyElement, label: Sha
         .when(narrow, |d| d.tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into()))
 }
 
-fn grip() -> impl IntoElement {
+pub(crate) fn grip() -> impl IntoElement {
     let dots = || div().flex().flex_col().gap(u(2.)).children((0..3).map(|_| div().size(u(2.)).rounded(u(1.)).bg(rgb(FAINT))));
     div()
         .flex_none()
