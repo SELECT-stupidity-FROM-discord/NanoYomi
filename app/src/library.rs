@@ -21,6 +21,7 @@ const PAD: f32 = 40.;
 const GAP: f32 = 20.;
 /// How many recent chapters the Updates page lists.
 const UPDATES: usize = 100;
+const CONTINUE_READING_SIZE: usize = 10;
 
 pub struct Resume {
     pub source: Source,
@@ -352,7 +353,7 @@ shelf_shape: (false, false),
         let avail = self.width / crate::zoom() - 2. * PAD;
         let n = ((avail + 14.) / 314.).floor().clamp(1., 3.) as usize;
         let w = (avail - 14. * (n - 1) as f32) / n as f32;
-        let cards: Vec<AnyElement> = self.shelf.clone().into_iter().take(n).map(|ix| {
+        let cards: Vec<AnyElement> = self.shelf.clone().into_iter().take(CONTINUE_READING_SIZE).map(|ix| {
             let image = self.cover_of(ix, cx);
             let s = &self.series[ix];
             let p = s.progress.clone().unwrap_or_else(|| unreachable!());
@@ -473,6 +474,7 @@ shelf_shape: (false, false),
             .collect();
         let undo_count = self.undo_count;
         div()
+            .w_full()
             .px(u(PAD))
             .pt(u(30.))
             .flex()
@@ -480,7 +482,16 @@ shelf_shape: (false, false),
             .gap(u(14.))
             .when(!cards.is_empty(), |d| {
                 d.child(Self::section_title("CONTINUE READING"))
-            .child(div().flex().gap(u(14.)).children(cards))
+                    .child(
+                        div()
+                            .id("continue-reading-scroll")
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .gap(u(14.))
+                            .overflow_x_scroll()
+                            .pb(u(6.))
+                            .children(cards))
             })
             .when(undo_count > 0, |d| {
                 d.child(crate::history_undo_banner(
@@ -826,7 +837,7 @@ impl Render for Library {
             self.library_len = self.series.len();
             self.stats = self.series.iter().map(|s| s.stats_of(&s.chapters)).collect();
             self.unread_total = self.stats.iter().map(|st| st.unread).sum();
-            let reading: Vec<Series> = store.history().into_iter().filter(|s| !store.hides_series(crate::store::Area::History, s)).take(3).cloned().map(|mut s| {
+            let reading: Vec<Series> = store.history().into_iter().filter(|s| !store.hides_series(crate::store::Area::History, s)).take(CONTINUE_READING_SIZE).cloned().map(|mut s| {
                 s.chapters = Arc::new(s.visible());
                 s.hidden_scanlators.clear();
                 s.scanlators_chosen = true;
