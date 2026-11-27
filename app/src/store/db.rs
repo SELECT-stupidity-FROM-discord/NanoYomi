@@ -19,7 +19,12 @@ use std::sync::Arc;
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 type Chapters = Arc<Vec<Value>>;
 
-const VERSION: i64 = 2;
+/// The first layout, which is what `SCHEMA` creates for a new file.
+const FIRST: i64 = 2;
+
+/// One entry per layout after the first, run in order on a file that hasn't had it yet. Adding a column or changing a table means an entry here, as well as `SCHEMA`.
+/// A new table needs none, since `SCHEMA` creates the ones that are missing. `a_layout_2_database_still_loads` fails until the step is written.
+const MIGRATIONS: &[&str] = &[];
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value);
@@ -432,6 +437,30 @@ fn group_hashes(d: &Data) -> [(&'static str, u64); 4] {
     ]
 }
 
+/// Brings a file up to the latest layout, or creates it. A file from another Nano is refused rather than guessed at.
+fn prepare(conn: &mut Connection, steps: &[&str]) -> Res<()> {
+    let latest = FIRST + steps.len() as i64;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let tables: i64 = conn.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table'", [], |r| r.get(0))?;
+    if tables > 0 {
+        if !(FIRST..=latest).contains(&version) {
+            return Err(format!("this library is laid out for another version of Nano (layout {version}, this one reads {FIRST} to {latest})").into());
+        }
+        for (i, sql) in steps.iter().enumerate() {
+            let to = FIRST + 1 + i as i64;
+            if version < to {
+                let tx = conn.transaction()?;
+                tx.execute_batch(sql)?;
+                tx.pragma_update(None, "user_version", to)?;
+                tx.commit()?;
+            }
+        }
+    }
+    conn.execute_batch(SCHEMA)?;
+    conn.pragma_update(None, "user_version", latest)?;
+    Ok(())
+}
+
 impl Db {
     pub fn new(path: PathBuf) -> Self {
         Db { path, conn: None, series: HashMap::new(), groups: HashMap::new() }
@@ -443,17 +472,11 @@ impl Db {
 
     fn open(&mut self) -> Res<&mut Connection> {
         if self.conn.is_none() {
-            let conn = Connection::open(&self.path)?;
+            let mut conn = Connection::open(&self.path)?;
             let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
-            let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            let tables: i64 = conn.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table'", [], |r| r.get(0))?;
-            if version != VERSION && tables > 0 {
-                return Err(format!("this library is laid out for another version of Nano (layout {version}, expected {VERSION})").into());
-            }
-            conn.execute_batch(SCHEMA)?;
-            conn.pragma_update(None, "user_version", VERSION)?;
+            prepare(&mut conn, MIGRATIONS)?;
             self.conn = Some(conn);
         }
         Ok(self.conn.as_mut().unwrap())
@@ -862,6 +885,74 @@ mod tests {
         let back = Db::new(copy).load().unwrap().unwrap();
         assert_eq!(json_of(&back), json_of(&data));
         assert!(!d.join("library.db.bak.new").exists());
+    }
+
+    /// A real layout 2 file, kept so a change to the tables that forgets its upgrade step fails here instead of for people who already have one.
+    fn layout_2() -> PathBuf {
+        let copy = dir("layout2").join("library.db");
+        std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/layout2.db"), &copy).unwrap();
+        copy
+    }
+
+    #[test]
+    fn a_layout_2_database_still_loads() {
+        let path = layout_2();
+        let mut db = Db::new(path.clone());
+        let back = db.load().expect("add an upgrade step to MIGRATIONS for the change to the tables").unwrap();
+        assert_eq!(json_of(&back), json_of(&full()), "layout 2 holds the library full() built then, update this if full() grew a field the old file can't have");
+        assert_eq!(db.save(back).unwrap(), 0, "a loaded library saves nothing");
+        let version: i64 = Connection::open(&path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, FIRST + MIGRATIONS.len() as i64, "the file is marked as upgraded");
+    }
+
+    /// Run once to make testdata/layout2.db again. Don't, unless layout 2 itself changes: its point is to be the old file.
+    #[test]
+    #[ignore]
+    fn write_the_layout_2_fixture() {
+        let (src, out) = (dir("fixture").join("library.db"), concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/layout2.db"));
+        Db::new(src.clone()).save(full()).unwrap();
+        let _ = std::fs::remove_file(out);
+        Connection::open(&src).unwrap().execute("VACUUM INTO ?1", params![out]).unwrap();
+    }
+
+    #[test]
+    fn an_older_layout_is_upgraded_in_place_without_losing_anything() {
+        let path = dir("upgrade").join("library.db");
+        Db::new(path.clone()).save(full()).unwrap();
+        let steps = ["ALTER TABLE series ADD COLUMN note TEXT NOT NULL DEFAULT 'none'", "CREATE INDEX series_source ON series(source)"];
+        let mut conn = Connection::open(&path).unwrap();
+        prepare(&mut conn, &steps).unwrap();
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, FIRST + 2);
+        let note: String = conn.query_row("SELECT note FROM series", [], |r| r.get(0)).unwrap();
+        assert_eq!(note, "none", "old rows get the default");
+        assert_eq!(conn.query_row("SELECT count(*) FROM marks", [], |r| r.get::<_, i64>(0)).unwrap(), 6, "the other tables are untouched");
+        prepare(&mut conn, &steps).unwrap();
+        let again: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(again, FIRST + 2, "a second launch runs nothing");
+    }
+
+    #[test]
+    fn a_step_that_fails_changes_nothing() {
+        let path = dir("failing").join("library.db");
+        Db::new(path.clone()).save(full()).unwrap();
+        let mut conn = Connection::open(&path).unwrap();
+        let steps = ["ALTER TABLE series ADD COLUMN half TEXT; ALTER TABLE nothing_here ADD COLUMN x TEXT"];
+        assert!(prepare(&mut conn, &steps).is_err());
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, FIRST, "still the old layout");
+        assert!(conn.query_row("SELECT half FROM series", [], |r| r.get::<_, String>(0)).is_err(), "and the first half of the step was undone");
+    }
+
+    #[test]
+    fn a_file_from_another_nano_is_refused() {
+        let path = dir("other").join("library.db");
+        Db::new(path.clone()).save(full()).unwrap();
+        let mut conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", FIRST + 5).unwrap();
+        assert!(prepare(&mut conn, &[]).is_err(), "newer than this Nano knows");
+        conn.pragma_update(None, "user_version", 0).unwrap();
+        assert!(prepare(&mut conn, &[]).is_err(), "the unnumbered layout from before layout 2");
     }
 
     #[test]
