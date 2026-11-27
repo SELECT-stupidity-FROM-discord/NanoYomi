@@ -7,20 +7,23 @@ use crate::images::ImageCache;
 use crate::registry::Registry;
 use crate::store::{Series, Store, ago, now_ms};
 use crate::segmented::Segmented;
-use gpui::AnimationExt;
+use gpui::{AnimationExt, App, ClickEvent, Div, Task, px};
 use crate::{ACCENT, ACCENT_TEXT, FAINT, LINE, MUTED, RULE, SURFACE, Source, TEXT, heading, pill};
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FontWeight, InteractiveElement, IntoElement, ListAlignment, ListState,
     ParentElement, Render, StatefulInteractiveElement, Styled, Subscription, Window, div, list,
     prelude::FluentBuilder, relative, rgb,
+    ScrollHandle, point
 };
 use serde_json::{Value, json};
+use std::time::{Duration, Instant};
 use std::sync::Arc;
 
 const PAD: f32 = 40.;
 const GAP: f32 = 20.;
 /// How many recent chapters the Updates page lists.
 const UPDATES: usize = 100;
+const CONTINUE_READING_SIZE: usize = 10;
 
 pub struct Resume {
     pub source: Source,
@@ -122,6 +125,8 @@ pub struct Library {
     shown: Vec<usize>,
     /// Indexes into `series` for Continue reading.
     shelf: Vec<usize>,
+    shelf_scroll: ScrollHandle,
+    shelf_anim: Option<Task<()>>,
     shelf_shape: (bool, bool),
     undo_count: usize,
     /// Bumped whenever the store changes. Rebuilding the library clones every series and chapter, so that only
@@ -192,7 +197,9 @@ impl Library {
             kept: 0,
             shown: vec![],
             shelf: vec![],
-shelf_shape: (false, false),
+            shelf_scroll: ScrollHandle::new(),
+            shelf_anim: None,
+            shelf_shape: (false, false),
             undo_count: 0,
             data_gen: 0,
             stats: vec![],
@@ -348,11 +355,106 @@ shelf_shape: (false, false),
         div().font_family(crate::fonts::mono()).text_size(u(13.)).font_weight(FontWeight::MEDIUM).text_color(rgb(MUTED)).child(text)
     }
 
+    fn page_continue_read(&mut self, dir: i32, cx: &mut Context<Self>) {
+        const EPS: f32 = 1.0;
+        const ANIMATION_DURATION: u64 = 16;
+
+        // Jump calculation starts here
+        let handle = self.shelf_scroll.clone();
+        let from = handle.offset().x;
+        let max_x = handle.max_offset().x;
+        let viewport_left = handle.bounds().left();
+
+        let scrolled = -f32::from(from);
+
+        // Each card's left edge in content coordinates in ascending order (0 for the first card).
+        // These don't change as you scroll, so they compare directly with `scrolled`.
+        let lefts = (0..handle.children_count())
+            .filter_map(|ix| handle.bounds_for_item(ix))
+            .map(|b| f32::from(b.left() - viewport_left));
+
+        let target = if dir > 0 {
+            // Find the next card to the right
+            lefts.clone().find(|l| *l > scrolled + EPS)
+        } else {
+            // Find the next card to the left
+            lefts.filter(|l| *l < scrolled - EPS).max_by(f32::total_cmp)
+        };
+
+        let Some(target) = target else { return };
+        let to = px(-target).clamp(-max_x, px(0.));
+
+        // If distance to move is less than a pixel, skip animation
+        if f32::from(to - from).abs() < 0.5 {
+            return;
+        }
+
+        // Animation handling starts here
+        let y = handle.offset().y;
+        let start = Instant::now();
+        let duration = Duration::from_millis(280);
+
+        // Assigning a new task drops (cancels) any animation still running
+        self.shelf_anim = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let t = (start.elapsed().as_secs_f32() / duration.as_secs_f32()).min(1.);
+                let eased = 1. - (1. - t).powi(3);
+                let x = from + (to - from) * eased;
+
+                let alive = this
+                    .update(cx, |this, cx| {
+                        this.shelf_scroll.set_offset(point(x, y));
+                        cx.notify();
+                    })
+                    .is_ok();
+
+                if !alive || t >= 1. {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(ANIMATION_DURATION))
+                    .await;
+            }
+        }));
+    }
+
+    fn continue_read_arrows(
+        id: &'static str,
+        glyph: &'static str,
+        left: bool,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Div {
+        div()
+            .absolute()
+            .when(left, |d| d.left(u(7.)))
+            .when(!left, |d| d.right(u(7.)))
+            .top_0()
+            .bottom(u(6.))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .child(
+                div()
+                    .id(id)
+                    .size(u(28.))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .invisible()
+                    .group_hover("continue-reading", |s| s.visible())
+                    .hover(|s| s.bg(rgb(SURFACE)))
+                    .child(div().text_size(u(22.)).text_color(rgb(TEXT)).child(glyph))
+                    .on_click(on_click),
+            )
+    }
+
     fn shelf(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let avail = self.width / crate::zoom() - 2. * PAD;
         let n = ((avail + 14.) / 314.).floor().clamp(1., 3.) as usize;
         let w = (avail - 14. * (n - 1) as f32) / n as f32;
-        let cards: Vec<AnyElement> = self.shelf.clone().into_iter().take(n).map(|ix| {
+        let cards: Vec<AnyElement> = self.shelf.clone().into_iter().take(CONTINUE_READING_SIZE).map(|ix| {
             let image = self.cover_of(ix, cx);
             let s = &self.series[ix];
             let p = s.progress.clone().unwrap_or_else(|| unreachable!());
@@ -471,8 +573,11 @@ shelf_shape: (false, false),
                 .into_any_element()
             })
             .collect();
+
         let undo_count = self.undo_count;
+
         div()
+            .w_full()
             .px(u(PAD))
             .pt(u(30.))
             .flex()
@@ -480,7 +585,50 @@ shelf_shape: (false, false),
             .gap(u(14.))
             .when(!cards.is_empty(), |d| {
                 d.child(Self::section_title("CONTINUE READING"))
-            .child(div().flex().gap(u(14.)).children(cards))
+                    .child(
+                        div()
+                            .w_full()
+                            .relative()
+                            .flex()
+                            .flex_row()
+                            .group("continue-reading")
+                            .child(
+                                // Scrollable area of continue reading
+                                div()
+                                    .id("continue-reading-scroll")
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .gap(u(14.))
+                                    .pb(u(6.))
+                                    .overflow_x_scroll()
+                                    .restrict_scroll_to_axis()
+                                    .track_scroll(&self.shelf_scroll)
+                                    .children(cards),
+                            )
+                            .child(
+                                // Left arrow key
+                                Self::continue_read_arrows(
+                                    "continue-reading-prev", "‹", true,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.page_continue_read(-1, cx);
+                                            cx.notify();
+                                            cx.stop_propagation();
+                                    }),
+                                )
+                            )
+                            .child(
+                                // Right arrow key
+                                Self::continue_read_arrows(
+                                    "continue-reading-next", "›", false,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.page_continue_read(1, cx);
+                                            cx.notify();
+                                            cx.stop_propagation();
+                                    }),
+                                )
+                            )
+                        )
             })
             .when(undo_count > 0, |d| {
                 d.child(crate::history_undo_banner(
@@ -826,7 +974,7 @@ impl Render for Library {
             self.library_len = self.series.len();
             self.stats = self.series.iter().map(|s| s.stats_of(&s.chapters)).collect();
             self.unread_total = self.stats.iter().map(|st| st.unread).sum();
-            let reading: Vec<Series> = store.history().into_iter().filter(|s| !store.hides_series(crate::store::Area::History, s)).take(3).cloned().map(|mut s| {
+            let reading: Vec<Series> = store.history().into_iter().filter(|s| !store.hides_series(crate::store::Area::History, s)).take(CONTINUE_READING_SIZE).cloned().map(|mut s| {
                 s.chapters = Arc::new(s.visible());
                 s.hidden_scanlators.clear();
                 s.scanlators_chosen = true;
